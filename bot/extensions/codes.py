@@ -192,6 +192,7 @@ class CodesCog(commands.GroupCog, name="codes"):
             362357860530651137,  # Ahskance
             376545699833184268,  # Boggzy
             212466672450142208,  # Trackpad
+            1136697968184012810, # Mistychu
         ]:
             interaction.extras["ignore_error"] = True
             await interaction.response.send_message("You can't use this command.")
