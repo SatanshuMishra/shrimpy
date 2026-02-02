@@ -1,5 +1,7 @@
 import aiohttp
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import functools
 import io
 import json
 import logging
@@ -12,6 +14,17 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
 T = TypeVar("T")
+
+# Thread pool for running sync Redis/RQ calls off the event loop
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="redis_rq")
+
+
+async def _run_sync(func: Callable[..., T], *args, **kwargs) -> T:
+    """Run a sync function in the thread pool to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor, functools.partial(func, *args, **kwargs)
+    )
 
 import discord
 import redis
@@ -27,7 +40,7 @@ from bot.utils import errors, functions
 from config import cfg
 
 logger = logging.getLogger("track")
-_url = f"redis://:{cfg.redis.password}@localhost:{cfg.redis.port}/"
+_url = f"redis://:{cfg.redis.password}@{cfg.redis.host}:{cfg.redis.port}/"
 _redis: redis.Redis = redis.from_url(_url)
 _async_redis: redis.asyncio.Redis = redis.asyncio.from_url(_url)
 
@@ -43,6 +56,19 @@ FAILED_TO_POST_MSG = "Could not post result (network error)."
 DISCORD_MAX_FILE_BYTES = 8 * 1024 * 1024
 DISCORD_MAX_MESSAGE_BYTES = 25 * 1024 * 1024
 DISCORD_EPHEMERAL_FLAG = 64
+# Minimum interval between non-terminal status embed edits (seconds) to avoid rate limits
+STATUS_EMBED_EDIT_MIN_INTERVAL = 1.5
+
+# Shared aiohttp session for webhook/ephemeral requests (lazy init, reused)
+_http_session: Optional[aiohttp.ClientSession] = None
+
+
+async def _get_http_session() -> aiohttp.ClientSession:
+    """Get or create the shared aiohttp session for webhook requests."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 # Exceptions that indicate transient network/SSL errors and warrant retry
 _NETWORK_RETRY_EXC = (OSError, ssl.SSLError, discord.HTTPException, aiohttp.ClientError)
@@ -331,7 +357,13 @@ class Render:
 
     @property
     def job_position(self) -> int:
+        """Sync property - use async_job_position in async code."""
         pos = self._job.get_position()
+        return pos + 1 if pos else 1
+
+    async def async_job_position(self) -> int:
+        """Get job position without blocking the event loop."""
+        pos = await _run_sync(self._job.get_position)
         return pos + 1 if pos else 1
 
     @property
@@ -344,7 +376,11 @@ class Render:
         raise NotImplementedError()
 
     async def _check(self) -> bool:
-        worker_count = rq.worker.Worker.count(connection=_redis, queue=self.QUEUE)
+        # Run sync RQ calls in executor to avoid blocking event loop
+        worker_count = await _run_sync(
+            rq.worker.Worker.count, connection=_redis, queue=self.QUEUE
+        )
+        queue_count = await _run_sync(lambda: self.QUEUE.count)
         cooldown = await _async_redis.ttl(f"cooldown_{self._interaction.user.id}")
 
         try:
@@ -352,7 +388,7 @@ class Render:
                 worker_count != 0
             ), f"{self._interaction.user.mention} No running workers detected."
             assert (
-                self.QUEUE.count <= self.QUEUE_SIZE
+                queue_count <= self.QUEUE_SIZE
             ), f"{self._interaction.user.mention} Queue full. Please try again later."
             assert (
                 cooldown <= 0
@@ -375,10 +411,12 @@ class Render:
     async def poll_result(
         self, input_name: str, filename: Optional[str] = None
     ) -> None:
-        embed = RenderWaitingEmbed(input_name, self.job_position, filename=filename)
+        initial_position = await self.async_job_position()
+        embed = RenderWaitingEmbed(input_name, initial_position, filename=filename)
         message = await self.message(embed=embed)
         last_position: Optional[int] = None
         last_progress: Optional[float] = None
+        last_edit_time: float = time.time()
 
         psub = _async_redis.pubsub()
         psub.ignore_subscribe_messages = True
@@ -388,11 +426,16 @@ class Render:
             if response["type"] != "pmessage":
                 continue
 
-            status = self._job.get_status(refresh=True)
+            # Run sync RQ call in executor to avoid blocking event loop
+            status = await _run_sync(self._job.get_status, refresh=True)
             match status:
                 case "queued":
-                    position = self.job_position
+                    position = await self.async_job_position()
                     if position == last_position:
+                        continue
+                    # Debounce: skip edit if too soon (unless first update)
+                    now = time.time()
+                    if now - last_edit_time < STATUS_EMBED_EDIT_MIN_INTERVAL:
                         continue
 
                     embed = RenderWaitingEmbed(
@@ -400,16 +443,24 @@ class Render:
                     )
                     message = await message.edit(embed=embed)
                     last_position = position
+                    last_edit_time = now
                 case "started":
-                    progress = self._job.get_meta(refresh=True).get("progress", 0.0)
+                    meta = await _run_sync(self._job.get_meta, refresh=True)
+                    progress = meta.get("progress", 0.0)
+                    task_status = meta.get("status", None)
                     if progress == last_progress:
+                        continue
+                    # Debounce: skip edit if too soon
+                    now = time.time()
+                    if now - last_edit_time < STATUS_EMBED_EDIT_MIN_INTERVAL:
                         continue
 
                     embed = RenderStartedEmbed(
-                        input_name, self._job, progress, filename=filename
+                        input_name, progress, task_status=task_status, filename=filename
                     )
                     message = await message.edit(embed=embed)
                     last_progress = progress
+                    last_edit_time = now
                 case "finished":
                     if not self._job.result:
                         continue
@@ -461,15 +512,18 @@ class Render:
                     await message.edit(embed=embed)
                     break
                 case "failed":
-                    timeout = self._job.get_meta(refresh=True).get("timeout", None)
+                    meta = await _run_sync(self._job.get_meta, refresh=True)
+                    timeout = meta.get("timeout", None)
                     if timeout:
                         logger.warning("Render job timed out")
                         embed = RenderFailureEmbed(
                             input_name, "Job timed out.", filename=filename
                         )
                     else:
-                        # fetch again to update exc_info
-                        job = rq.job.Job.fetch(self._job.id, connection=_redis)
+                        # fetch again to update exc_info (in executor)
+                        job = await _run_sync(
+                            rq.job.Job.fetch, self._job.id, connection=_redis
+                        )
                         task_status = self._job.meta.get("status", None)
                         logger.error(
                             f'Render job failed with status "{task_status}"\n{job.exc_info}'
@@ -489,7 +543,7 @@ class Render:
                 case _base:
                     if status is None:
                         await asyncio.sleep(UNKNOWN_JOB_STATUS_RETRY)
-                        status = self._job.get_status(refresh=True)
+                        status = await _run_sync(self._job.get_status, refresh=True)
                         if status is not None:
                             continue
 
@@ -683,10 +737,10 @@ class RenderWT(Render):
 
     async def on_success(self, data: bytes, message: discord.Message) -> None:
         if self.callback_url:
-            async with aiohttp.ClientSession() as session:
-                await session.post(
-                    f"{self.callback_url}&messageId={message.id}",
-                )
+            session = await _get_http_session()
+            await session.post(
+                f"{self.callback_url}&messageId={message.id}",
+            )
 
     async def start(self, name_a: str, name_b: str) -> None:
         if not await self._check():
@@ -794,27 +848,18 @@ class RenderStartedEmbed(RenderEmbed):
     def __init__(
         self,
         input_name: str,
-        job: rq.job.Job,
         progress: float,
+        task_status: Optional[str] = None,
         filename: Optional[str] = None,
     ):
-        if task_status := job.get_meta(refresh=True).get("status", None):
-            super().__init__(
-                self.COLOR,
-                RenderEmbed.TITLE_PROCESSING,
-                input_name,
-                filename=filename,
-                status=task_status.title(),
-                progress=progress,
-            )
-        else:
-            super().__init__(
-                self.COLOR,
-                RenderEmbed.TITLE_PROCESSING,
-                input_name,
-                filename=filename,
-                status="Started",
-            )
+        super().__init__(
+            self.COLOR,
+            RenderEmbed.TITLE_PROCESSING,
+            input_name,
+            filename=filename,
+            status=task_status.title() if task_status else "Started",
+            progress=progress,
+        )
 
 
 class RenderSuccessEmbed(RenderEmbed):
@@ -866,9 +911,9 @@ async def _send_ephemeral_followup(
     url = f"https://discord.com/api/v10/webhooks/{application_id}/{token}"
     payload = {"content": content, "flags": DISCORD_EPHEMERAL_FLAG}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                return resp.status in (200, 204)
+        session = await _get_http_session()
+        async with session.post(url, json=payload) as resp:
+            return resp.status in (200, 204)
     except Exception as e:
         logger.warning("Failed to send ephemeral followup: %s", e)
         return False
@@ -907,11 +952,14 @@ async def _batch_check(
     count: int,
 ) -> bool:
     """Validate batch can run; send error to channel and return False if not."""
-    worker_count = rq.worker.Worker.count(connection=_redis, queue=RenderSingle.QUEUE)
+    # Run sync RQ/Redis calls in executor to avoid blocking event loop
+    worker_count = await _run_sync(
+        rq.worker.Worker.count, connection=_redis, queue=RenderSingle.QUEUE
+    )
+    cooldown = await _async_redis.ttl(f"cooldown_{user_id}")
+    task_request_exists = await _async_redis.exists(f"task_request_{user_id}")
+    queue_count = await _run_sync(lambda: RenderSingle.QUEUE.count)
     try:
-        cooldown = _redis.ttl(f"cooldown_{user_id}")
-        task_request_exists = _redis.exists(f"task_request_{user_id}")
-        queue_count = RenderSingle.QUEUE.count
         assert worker_count != 0, f"{user_mention} No running workers detected."
         assert queue_count + count <= RenderSingle.QUEUE_SIZE, (
             f"{user_mention} Queue full. Please try again later."
@@ -948,7 +996,8 @@ async def _poll_single_batch_job(
     Updates results_list[job_index] and the status embed.
     Does NOT handle combined send or cleanup (coordinator does that).
     """
-    job = rq.job.Job.fetch(job_id, connection=_redis)
+    # Run sync RQ call in executor to avoid blocking event loop
+    job = await _run_sync(rq.job.Job.fetch, job_id, connection=_redis)
     psub = _async_redis.pubsub()
     psub.ignore_subscribe_messages = True
     await psub.psubscribe(f"*{job_id}")
@@ -958,7 +1007,8 @@ async def _poll_single_batch_job(
             if response["type"] != "pmessage":
                 continue
 
-            status = job.get_status(refresh=True)
+            # Run sync RQ call in executor
+            status = await _run_sync(job.get_status, refresh=True)
             if status not in ("finished", "failed"):
                 continue
 
@@ -1033,7 +1083,8 @@ async def _poll_single_batch_job(
                             "Unknown result.",
                         )
                 elif status == "failed":
-                    timeout = job.get_meta(refresh=True).get("timeout", False)
+                    meta = await _run_sync(job.get_meta, refresh=True)
+                    timeout = meta.get("timeout", False)
                     err = "Job timed out." if timeout else "An unhandled error occurred."
                     results_list[job_index] = (filename, "Failed", err)
                     try:

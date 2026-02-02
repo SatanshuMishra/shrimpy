@@ -46,10 +46,27 @@ def timeout_handler(job: Job, _exc_type, exc_value, _traceback):
         job.save_meta()
 
 
-def progress_callback(job: Job):
+def progress_callback(job: Job, min_delta: float = 0.05, min_interval: float = 1.0):
+    """
+    Create a throttled progress callback that only writes to Redis when:
+    - Progress has changed by at least min_delta (default 5%), OR
+    - At least min_interval seconds (default 1s) have passed since last write
+    This reduces Redis write volume while still providing reasonable updates.
+    """
+    last_progress = [0.0]
+    last_time = [time.perf_counter()]
+
     def callback(progress: float):
-        job.meta["progress"] = progress
-        job.save_meta()
+        now = time.perf_counter()
+        delta = abs(progress - last_progress[0])
+        elapsed = now - last_time[0]
+
+        # Only write if progress changed enough OR enough time has passed
+        if delta >= min_delta or elapsed >= min_interval:
+            job.meta["progress"] = progress
+            job.save_meta()
+            last_progress[0] = progress
+            last_time[0] = now
 
     return callback
 
