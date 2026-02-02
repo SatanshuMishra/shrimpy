@@ -24,6 +24,7 @@ COMMANDS = [
     "inspect",
     "link",
     "render",
+    "renderbatch",
     "stats",
     "mystats",
     "update",

@@ -143,13 +143,29 @@ class Track(commands.AutoShardedBot):
 
         if self.sync:
             logs.logger.info("Syncing tree...")
-            await self.tree.sync()
-            logs.logger.info(f"Tree Synced")
+            sync_guild_id = os.environ.get("SYNC_GUILD_ID")
+            if sync_guild_id:
+                try:
+                    guild = discord.Object(id=int(sync_guild_id))
+                    self.tree.copy_global_to(guild=guild)
+                    await self.tree.sync(guild=guild)
+                    logs.logger.info(f"Tree Synced (guild {sync_guild_id})")
+                except ValueError:
+                    logs.logger.warning("Invalid SYNC_GUILD_ID; falling back to global sync")
+                    await self.tree.sync()
+                    logs.logger.info("Tree Synced")
+            else:
+                await self.tree.sync()
+                logs.logger.info("Tree Synced")
 
     async def load_extensions(self) -> None:
         for root, dirs, files in os.walk(EXTENSIONS_PATH):
             for file in files:
                 if file.endswith("py"):
+                    # Temporarily skip cat extension (missing Twitter token)
+                    if file == "cat.py":
+                        logs.logger.warning("Skipping cat.py extension (missing Twitter token)")
+                        continue
                     try:
                         extension = f"extensions.{file[:-3]}".replace("/", ".")
                         await self.load_extension(extension)

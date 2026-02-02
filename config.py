@@ -21,9 +21,13 @@ class TrackConfig:
 
     @environ.config(prefix="REDIS")
     class Redis:
-        port = 6379
-        password = ini_secrets.secret(name="redis_password")
-        host = ini_secrets.secret(name="redis_host")
+        port = environ.var(6379, converter=int)
+        password = environ.var(
+            name="REDIS_PASSWORD", default=ini_secrets.secret(name="redis_password")
+        )
+        host = environ.var(
+            name="REDIS_HOST", default=ini_secrets.secret(name="redis_host")
+        )
 
     redis = environ.group(Redis)
 
@@ -46,10 +50,18 @@ class TrackConfig:
     twitter = environ.group(Twitter)
 
 
-cfg: TrackConfig = TrackConfig.from_environ(
-    environ={
+def _build_environ():
+    env = {
         "CREATED": 1663989263,
         "DISCORD_OWNER_IDS": {212466672450142208, 113104128783159296},
         "CHANNELS_FAILED_RENDERS": 1010834704804614184,
+        "REDIS_PORT": int(os.environ.get("REDIS_PORT", 6379)),
     }
-)
+    if "REDIS_PASSWORD" in os.environ:
+        env["REDIS_PASSWORD"] = os.environ["REDIS_PASSWORD"]
+    if "REDIS_HOST" in os.environ:
+        env["REDIS_HOST"] = os.environ["REDIS_HOST"]
+    return env
+
+
+cfg: TrackConfig = TrackConfig.from_environ(environ=_build_environ())

@@ -2,6 +2,7 @@ import os
 
 import cachetools
 import cachetools.keys
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import Boolean, Column, Float, Integer, JSON, String
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -56,8 +57,14 @@ class CachedMixin:
                 # noinspection PyArgumentList
                 obj = cls(**kwargs)
                 session.add(obj)
-                await session.commit()
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
             cls.invalidate(**kwargs)
+            # re-fetch in case of race
+            if result := await cls.get(**kwargs):
+                return result[0][0]
             return obj
 
 

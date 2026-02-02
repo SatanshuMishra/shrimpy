@@ -115,6 +115,17 @@ Options:
 This is a wrapper of [Minimap Renderer](https://github.com/WoWs-Builder-Team/minimap_renderer).
 Issues with it should be redirected there.
 
+`/renderbatch [fps] [quality] [logs] [anon] [chat] [team_tracers]`
+
+Queues multiple `*.wowsreplay` files for minimap renders in one flow. After running the command, **reply to the bot's message** with your replay file(s) (up to **15** .wowsreplay files). Discord allows up to 10 attachments per message, so you can attach up to 10 files in a single reply.
+
+Options (same as `/render`):
+- `fps` - Can be a value from `15` to `30`; defaults to `20`.
+- `quality` - Can be a value from `1` to `9`; defaults to `7`.
+- `logs`, `anon`, `chat`, `team_tracers` - Same as `/render`.
+
+The bot will post a status message and update it as each render completes. Cooldown applies once after the entire batch finishes.
+
 `/stats [region] <player> [ship]`
 
 Fetches player information, optionally in a specified region.

@@ -19,7 +19,7 @@ KEYS = (
     "typeinfo.nation",
 )
 GAMEPARAMS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "../../resources/GameParams.data"
+    os.path.dirname(os.path.abspath(__file__)), "../../resources/GameParams.json"
 )
 OUTPUT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "../../generated/ships.json"
@@ -60,19 +60,27 @@ def main():
             translations[locale] = {entry.msgid: entry.msgstr for entry in mo_file}
 
     print("Loading GameParams...")
-    with open(GAMEPARAMS_PATH, "rb") as fp:
-        gp_data: bytes = fp.read()
-
-    gp_data: bytes = struct.pack("B" * len(gp_data), *gp_data[::-1])
-    gp_data: bytes = zlib.decompress(gp_data)
-    gp_data: dict = pickle.loads(gp_data, encoding=ENCODING)[0]
+    with open(GAMEPARAMS_PATH, "r", encoding="utf-8") as fp:
+        gp_data: dict = json.load(fp)
 
     ships = []
     for index, entity in gp_data.items():
-        if entity.typeinfo.type == "Ship":
-            data = {key[key.rfind(".") + 1 :]: rgetattr(entity, key) for key in KEYS}
-            data["translations"] = get_translations(entity.index)
-            ships.append(data)
+        # Check if this is a Ship type
+        if entity.get("typeinfo", {}).get("type") != "Ship":
+            continue
+            
+        data = {
+            "id": entity.get("id"),
+            "index": entity.get("index"),
+            "isPaperShip": entity.get("isPaperShip", False),
+            "group": entity.get("group"),
+            "level": entity.get("level"),
+            "name": entity.get("name"),
+            "species": entity.get("typeinfo", {}).get("species"),
+            "nation": entity.get("typeinfo", {}).get("nation"),
+        }
+        data["translations"] = get_translations(entity.get("index", ""))
+        ships.append(data)
 
     with open(OUTPUT_PATH, "w") as fp:
         json.dump(ships, fp, indent=4)

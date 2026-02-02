@@ -44,7 +44,7 @@ class BuildsView(ui.View):
 class BuildsCog(commands.Cog):
     def __init__(self, bot: Track):
         self.bot: Track = bot
-        with open(BUILDS_PATH) as fp:
+        with open(BUILDS_PATH, encoding='utf-8') as fp:
             data = toml.load(fp)
             self.builds = {
                 k: v for k, v in sorted(data.items(), key=lambda i: len(i[1]["ships"]))
