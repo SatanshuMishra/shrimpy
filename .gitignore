@@ -6,4 +6,5 @@ secrets.ini
 # Generated ships data: scripts/ships/generate.py writes to generated/ (see generated/.gitignore);
 # then moved to bot assets per UPDATING.md — do not version these
 /bot/assets/public/ships.json
-/bot/assets/public/ships_silhouettes/
+/bot/assets/public/ships_silhouettes/*
+!/bot/assets/public/ships_silhouettes/.gitignore

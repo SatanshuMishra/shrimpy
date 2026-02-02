@@ -16,7 +16,7 @@ A virtual environment can be created with `python3.10 -m venv venv`.
 2. Clone the repository
 
 ```
-git clone https://github.com/padtrack/track.git
+git clone https://github.com/SatanshuMishra/shrimpy.git
 ```
 
 3. Install dependencies
