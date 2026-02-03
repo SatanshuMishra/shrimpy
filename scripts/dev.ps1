@@ -119,7 +119,9 @@ function Start-Redis {
         docker start $RedisContainer | Out-Null
     } else {
         Write-Output "[...] Creating Redis container..."
-        docker run -d --name $RedisContainer -p "${RedisPort}:6379" redis:latest redis-server --requirepass $RedisPassword | Out-Null
+        # SECURITY: Bind to localhost only (127.0.0.1) to prevent LAN/WAN exposure
+        # Redis with RQ uses pickle serialization; exposed Redis = potential RCE
+        docker run -d --name $RedisContainer -p "127.0.0.1:${RedisPort}:6379" redis:latest redis-server --requirepass $RedisPassword | Out-Null
     }
 
     Start-Sleep 2
