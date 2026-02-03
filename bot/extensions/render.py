@@ -11,6 +11,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Awaitable, Callable, Optional, TypeVar
 
 T = TypeVar("T")
@@ -31,13 +32,14 @@ import redis
 import rq
 import rq.job
 import rq.worker
+from rq import Retry
 from discord import app_commands, ui
 from discord.ext import commands
 
 from bot import tasks
 from bot.shrimpy import Shrimpy
 from bot.utils import errors, functions
-from bot.utils.replay_stats import BattleStats, format_win_rate_line
+from bot.utils.replay_stats import BattleStats, aggregate_win_rate, format_win_rate_line
 from config import cfg
 
 logger = logging.getLogger("shrimpy")
@@ -111,6 +113,37 @@ DISCORD_MAX_MESSAGE_BYTES = 25 * 1024 * 1024
 DISCORD_EPHEMERAL_FLAG = 64
 # Minimum interval between non-terminal status embed edits (seconds) to avoid rate limits
 STATUS_EMBED_EDIT_MIN_INTERVAL = 1.5
+# Fallback: poll RQ job status every N seconds if pubsub never fires (avoids blocking forever)
+BATCH_POLL_STATUS_FALLBACK_SECONDS = 15
+# Min/max time to wait for one batch job (from batch start). Per-job timeout is scaled by batch size
+# so later jobs (e.g. 8–10) have enough wall time; otherwise all tasks share one 30-min window.
+# Industry standard: allocate 10 min per job (renders average 3–6 min, with buffer for slow replays).
+BATCH_POLL_MAX_WAIT_MIN_SECONDS = 30 * 60        # 30 min minimum
+BATCH_POLL_MAX_WAIT_PER_JOB_SECONDS = 10 * 60    # 10 min per job (generous buffer)
+BATCH_POLL_MAX_WAIT_CAP_SECONDS = 150 * 60       # 2.5 hours max
+
+# Batch job reliability: RQ retry configuration
+# Industry standard: 3 retries to handle transient failures.
+# Note: Windows workers don't support scheduled delays (no SIGALRM), so use immediate retries.
+# The recovery loop provides additional safety net after all retries are exhausted.
+BATCH_JOB_RETRY_MAX = 3
+
+# Batch job TTL: how long a job can stay queued before RQ discards it.
+# Must be long enough for all jobs in the batch to START (not finish).
+# Formula: (queue_depth + batch_size) * per_job_execution_time + buffer
+BATCH_JOB_TTL_PER_JOB_SECONDS = 10 * 60  # 10 min per job in queue
+BATCH_JOB_TTL_MIN_SECONDS = 60 * 60      # 1 hour minimum
+
+# Batch job result TTL: how long finished results stay in Redis.
+# Must be long enough for recovery to fetch results after all poll tasks exit.
+# Industry standard: keep results for entire batch duration + buffer.
+BATCH_JOB_RESULT_TTL_SECONDS = 90 * 60   # 90 minutes (longer than max batch time)
+BATCH_JOB_FAILURE_TTL_SECONDS = 90 * 60  # 90 minutes
+
+# Recovery: how long to wait for still-running jobs before giving up.
+# After poll tasks exit, recovery loops and waits for jobs that are "started" in RQ.
+BATCH_RECOVERY_MAX_WAIT_SECONDS = 30 * 60   # 30 min max wait in recovery loop
+BATCH_RECOVERY_POLL_INTERVAL_SECONDS = 10   # Check every 10s for job completion
 
 # Shared aiohttp session for webhook/ephemeral requests (lazy init, reused)
 _http_session: Optional[aiohttp.ClientSession] = None
@@ -302,6 +335,48 @@ def format_replay_display(filename: str) -> str:
     return (
         f"{parsed['date']} {parsed['time']} · {parsed['ship_name']} · {map_display}"
     )
+
+
+def _replay_datetime_to_unix(date_str: str, time_str: str, tz_name: str) -> Optional[int]:
+    """
+    Interpret date_str (YYYY-MM-DD) and time_str (HH:MM) in the given IANA timezone,
+    return Unix timestamp (seconds since epoch, UTC) for Discord dynamic timestamps.
+    Returns None if parsing or timezone fails.
+    """
+    try:
+        dt_naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        tz = ZoneInfo(tz_name)
+        dt_local = dt_naive.replace(tzinfo=tz)
+        return int(dt_local.timestamp())
+    except (ValueError, TypeError, Exception):
+        return None
+
+
+def format_replay_summary_line(filename: str) -> str:
+    """
+    One-line for include_summary: Discord dynamic time + map only (no date, no ship).
+    Time is shown in the viewer's timezone via <t:unix:t>. Map uses _format_map_display.
+    Falls back to format_replay_display if parse or timestamp fails.
+    """
+    parsed = _parse_replay_filename(filename)
+    if not parsed:
+        return format_replay_display(filename)
+    tz_name = cfg.render.replay_timezone or "UTC"
+    unix_ts = _replay_datetime_to_unix(parsed["date"], parsed["time"], tz_name)
+    map_display = _format_map_display(parsed["map_name"])
+    if unix_ts is not None:
+        return f"<t:{unix_ts}:t> · {map_display}"
+    return f"{parsed['time']} · {map_display}"
+
+
+def _format_summary_overall_stats(batch_battle_stats: Optional[list]) -> str:
+    """Build '**Overall Statistics**:\\n\\nWin-Rate: 60%' block for include_summary. Only titles bold."""
+    if not batch_battle_stats:
+        return ""
+    wins, total, rate = aggregate_win_rate(batch_battle_stats)
+    if total == 0 or rate is None:
+        return ""
+    return f"**Overall Statistics**:\n\nWin-Rate: {rate:.0f}%"
 
 
 WOWS_TOURNAMENTS_CHANNELS = [
@@ -859,14 +934,26 @@ def _format_render_summary(filename: Optional[str]) -> Optional[str]:
     )
 
 
-def _batch_progress_footer(done: int, total: int) -> str:
-    """Build footer text for batch processing embed: progress bar + 'done/total replays'."""
-    width = 10
+# Progress bar spans full footer width; ~30 blocks matches typical Discord embed width
+BATCH_PROGRESS_BAR_WIDTH = 30
+
+
+def _batch_progress_footer(
+    done: int, total: int, progress_fraction: Optional[float] = None
+) -> str:
+    """
+    Build footer text for batch processing embed: full-width progress bar + 'done/total replays'.
+    Bar reflects actual progress: if progress_fraction is set, use it (0.0–1.0); else use done/total.
+    """
+    width = BATCH_PROGRESS_BAR_WIDTH
     if total <= 0:
-        filled, empty = 0, width
+        frac = 0.0
+    elif progress_fraction is not None:
+        frac = max(0.0, min(1.0, progress_fraction))
     else:
-        filled = min(width, round((done / total) * width))
-        empty = width - filled
+        frac = done / total
+    filled = min(width, round(frac * width))
+    empty = width - filled
     bar = (
         f"{Render.PROGRESS_FOREGROUND * filled}"
         f"{Render.PROGRESS_BACKGROUND * empty}"
@@ -1074,11 +1161,82 @@ async def _batch_check(
         return False
 
 
+def _batch_aggregate_progress(job_ids: list, total: int) -> float:
+    """
+    Compute batch progress fraction (0.0–1.0) from RQ job statuses and current job progress.
+    Each job contributes 1.0 if finished/failed, or meta['progress'] if started, else 0.
+    """
+    if total <= 0:
+        return 0.0
+    progress_sum = 0.0
+    for jid in job_ids:
+        try:
+            job = rq.job.Job.fetch(jid, connection=_redis)
+        except Exception:
+            continue
+        status = job.get_status(refresh=True)
+        if status in ("finished", "failed"):
+            progress_sum += 1.0
+        elif status == "started":
+            progress_sum += float(job.get_meta(refresh=True).get("progress", 0.0))
+    return progress_sum / total
+
+
+async def _batch_progress_updater(
+    status_message: discord.Message,
+    job_ids: list,
+    results_list: list,
+    total: int,
+    lock: asyncio.Lock,
+) -> None:
+    """
+    Periodically update the batch status embed footer with actual progress (completed jobs + current job progress).
+    Run until cancelled by the coordinator when all poll tasks complete.
+    """
+    try:
+        while True:
+            await asyncio.sleep(STATUS_EMBED_EDIT_MIN_INTERVAL)
+            async with lock:
+                any_still_queued = any(st == "Queued" for _, st, _ in results_list)
+                if not any_still_queued:
+                    continue
+                desc_lines = []
+                for i, (fn, st, link) in enumerate(results_list):
+                    display = format_replay_display(fn)
+                    line = f"{i + 1}. **{display}**: {st}"
+                    if st == "Done" and link:
+                        line += f" — [Link]({link})"
+                    elif st == "Failed" and link:
+                        line += f" — {link}"
+                    desc_lines.append(line)
+                done_count = sum(1 for _, st, _ in results_list if st != "Queued")
+            progress_frac = await _run_sync(
+                _batch_aggregate_progress, job_ids, total
+            )
+            embed = discord.Embed(
+                title=RenderEmbed.BATCH_TITLE_PROCESSING,
+                color=RenderEmbed.BATCH_COLOR_PROCESSING,
+                description="\n".join(desc_lines),
+            )
+            embed.set_footer(
+                text=_batch_progress_footer(
+                    done_count, total, progress_fraction=progress_frac
+                )
+            )
+            try:
+                await status_message.edit(embed=embed)
+            except Exception as e:
+                logger.warning("Could not update batch progress embed: %s", e)
+    except asyncio.CancelledError:
+        pass
+
+
 async def _poll_single_batch_job(
     bot: Shrimpy,
     channel: discord.abc.Messageable,
     status_message: discord.Message,
     job_id: str,
+    job_ids: list,
     filename: str,
     replay_bytes: bytes,
     job_index: int,
@@ -1100,15 +1258,59 @@ async def _poll_single_batch_job(
     psub = _async_redis.pubsub()
     psub.ignore_subscribe_messages = True
     await psub.psubscribe(f"*{job_id}")
+    listener = psub.listen()
+    started_at = time.time()
+    # Timeout scales with batch size so later jobs (e.g. 8–10) have enough wall time.
+    wait_cap = min(
+        BATCH_POLL_MAX_WAIT_CAP_SECONDS,
+        max(
+            BATCH_POLL_MAX_WAIT_MIN_SECONDS,
+            total * BATCH_POLL_MAX_WAIT_PER_JOB_SECONDS,
+        ),
+    )
 
     try:
-        async for response in psub.listen():
-            if response["type"] != "pmessage":
+        while True:
+            # Wait for pubsub message or fallback timeout; then always check RQ status.
+            # This avoids blocking forever if Redis never publishes (e.g. missed event, worker crash).
+            try:
+                response = await asyncio.wait_for(
+                    listener.__anext__(),
+                    timeout=BATCH_POLL_STATUS_FALLBACK_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                response = None
+            if response is not None and response.get("type") != "pmessage":
                 continue
 
-            # Run sync RQ call in executor
             status = await _run_sync(job.get_status, refresh=True)
             if status not in ("finished", "failed"):
+                if (time.time() - started_at) >= wait_cap:
+                    async with lock:
+                        results_list[job_index] = (
+                            filename,
+                            "Failed",
+                            "Job did not complete in time.",
+                        )
+                        any_still_queued = any(st == "Queued" for _, st, _ in results_list)
+                        desc_lines = [
+                            f"{i + 1}. **{format_replay_display(fn)}**: {st}"
+                            + (f" — [Link]({link})" if st == "Done" and link else "")
+                            + (f" — {link}" if st == "Failed" and link else "")
+                            for i, (fn, st, link) in enumerate(results_list)
+                        ]
+                        title = RenderEmbed.BATCH_TITLE_PROCESSING if any_still_queued else RenderEmbed.TITLE_SUMMARY
+                        color = RenderEmbed.BATCH_COLOR_PROCESSING if any_still_queued else RenderEmbed.BATCH_COLOR_COMPLETE
+                        embed = discord.Embed(title=title, color=color, description="\n".join(desc_lines))
+                        if any_still_queued:
+                            done_count = sum(1 for _, st, _ in results_list if st != "Queued")
+                            progress_frac = await _run_sync(_batch_aggregate_progress, job_ids, total)
+                            embed.set_footer(text=_batch_progress_footer(done_count, total, progress_fraction=progress_frac))
+                        try:
+                            await status_message.edit(embed=embed)
+                        except Exception as e:
+                            logger.warning("Could not update batch status embed: %s", e)
+                    break
                 continue
 
             async with lock:
@@ -1234,8 +1436,13 @@ async def _poll_single_batch_job(
                     done_count = sum(
                         1 for _, st, _ in results_list if st != "Queued"
                     )
+                    progress_frac = await _run_sync(
+                        _batch_aggregate_progress, job_ids, total
+                    )
                     embed.set_footer(
-                        text=_batch_progress_footer(done_count, total)
+                        text=_batch_progress_footer(
+                            done_count, total, progress_fraction=progress_frac
+                        )
                     )
                 try:
                     await status_message.edit(embed=embed)
@@ -1245,6 +1452,152 @@ async def _poll_single_batch_job(
     finally:
         await psub.unsubscribe()
         await psub.close()
+
+
+async def _recover_finished_batch_jobs(
+    bot: Shrimpy,
+    channel: discord.abc.Messageable,
+    job_ids: list,
+    filenames: list,
+    bytes_list: list,
+    results_list: list,
+    rendered_files: Optional[list],
+    batch_battle_stats: Optional[list],
+    single_message: bool,
+) -> None:
+    """
+    Industry-standard recovery loop: wait for and recover jobs that are still running or
+    have finished after poll tasks exited. Loops until all jobs are done/failed or max wait.
+
+    This handles:
+    - Jobs that finished after their poll task timed out
+    - Jobs that are still running (waits for them)
+    - Jobs that were retried by RQ and have since completed
+
+    Best practice: poll with exponential backoff, max wait time, log recoveries.
+    """
+    recovery_start = time.time()
+    recovered_count = 0
+
+    while True:
+        # Check if we've exceeded max recovery time
+        if (time.time() - recovery_start) >= BATCH_RECOVERY_MAX_WAIT_SECONDS:
+            logger.warning(
+                "Batch recovery max wait (%s s) exceeded; %s jobs recovered, proceeding with available results",
+                BATCH_RECOVERY_MAX_WAIT_SECONDS,
+                recovered_count,
+            )
+            break
+
+        # Check which jobs still need recovery
+        jobs_needing_recovery = []
+        jobs_still_running = []
+        for i in range(len(job_ids)):
+            fn, st, link = results_list[i]
+            if st == "Done":
+                continue
+            # Recoverable: Queued, or Failed with specific timeout message
+            if st == "Queued" or (st == "Failed" and link == "Job did not complete in time."):
+                jobs_needing_recovery.append(i)
+
+        if not jobs_needing_recovery:
+            # All jobs are done or permanently failed
+            break
+
+        # Check RQ status for each job needing recovery
+        for i in jobs_needing_recovery:
+            fn = results_list[i][0]
+            try:
+                job = await _run_sync(
+                    rq.job.Job.fetch, job_ids[i], connection=_redis
+                )
+            except Exception as e:
+                logger.debug("Recovery: could not fetch job %s: %s", job_ids[i], e)
+                continue
+
+            status = await _run_sync(job.get_status, refresh=True)
+
+            if status == "started" or status == "queued" or status == "scheduled":
+                # Job is still running or waiting; we'll wait and check again
+                jobs_still_running.append(i)
+                continue
+
+            if status == "finished" and job.result and isinstance(job.result, tuple):
+                # Job completed! Recover the result.
+                data, out_name, time_taken, builds_str, chat = job.result[:5]
+                battle_stats = job.result[5] if len(job.result) >= 6 else None
+
+                if rendered_files is not None and i < len(rendered_files):
+                    rendered_files[i] = (out_name, data)
+                if batch_battle_stats is not None and i < len(batch_battle_stats):
+                    batch_battle_stats[i] = battle_stats
+
+                if single_message:
+                    results_list[i] = (fn, "Done", None)
+                else:
+                    if len(data) > DISCORD_MAX_FILE_BYTES:
+                        results_list[i] = (fn, "Failed", "File too large (>8 MB).")
+                    else:
+                        async def _send_one(out=out_name, d=data, b=builds_str, c=chat):
+                            if b:
+                                view = RenderView(json.loads(b), c)
+                                sent = await channel.send(
+                                    content=None,
+                                    file=discord.File(io.BytesIO(d), f"{out}.mp4"),
+                                    view=view,
+                                )
+                                view.message = sent
+                                return sent
+                            return await channel.send(
+                                content=None,
+                                file=discord.File(io.BytesIO(d), f"{out}.mp4"),
+                            )
+
+                        sent = await _send_with_retry(
+                            BATCH_POST_RESULT_ATTEMPTS,
+                            BATCH_POST_RESULT_RETRY_DELAY_BASE,
+                            _send_one,
+                            f"Batch job {job_ids[i]} recovery send",
+                        )
+                        if sent is not None:
+                            results_list[i] = (fn, "Done", sent.jump_url)
+                        else:
+                            results_list[i] = (fn, "Failed", FAILED_TO_POST_MSG)
+
+                recovered_count += 1
+                logger.info(
+                    "Recovered batch job %s (index %s) from RQ after poll task had exited",
+                    job_ids[i],
+                    i,
+                )
+
+            elif status == "failed":
+                # Job failed permanently; mark as failed (no retry left)
+                meta = await _run_sync(job.get_meta, refresh=True)
+                timeout = meta.get("timeout", False)
+                err = "Job timed out." if timeout else "Render failed after retries."
+                results_list[i] = (fn, "Failed", err)
+                logger.warning(
+                    "Batch job %s (index %s) failed permanently in RQ: %s",
+                    job_ids[i],
+                    i,
+                    err,
+                )
+
+        # If there are still jobs running in RQ, wait before next poll
+        if jobs_still_running:
+            logger.debug(
+                "Recovery: %s jobs still running in RQ, waiting %s s before next check",
+                len(jobs_still_running),
+                BATCH_RECOVERY_POLL_INTERVAL_SECONDS,
+            )
+            await asyncio.sleep(BATCH_RECOVERY_POLL_INTERVAL_SECONDS)
+        else:
+            # No jobs still running; we've processed everything we can
+            break
+
+    if recovered_count > 0:
+        logger.info("Batch recovery complete: %s jobs recovered", recovered_count)
 
 
 async def _batch_coordinator(
@@ -1283,6 +1636,7 @@ async def _batch_coordinator(
                     channel,
                     status_message,
                     job_id,
+                    job_ids,
                     filename,
                     replay_bytes,
                     i,
@@ -1299,8 +1653,34 @@ async def _batch_coordinator(
             )
         ]
 
+        # Progress updater: periodically refresh footer with actual progress (full-width bar)
+        progress_task = asyncio.create_task(
+            _batch_progress_updater(
+                status_message, job_ids, results_list, total, lock
+            )
+        )
+
         # Wait for ALL poll tasks to complete (exceptions absorbed)
         await asyncio.gather(*poll_tasks, return_exceptions=True)
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+
+        # Recover any jobs that finished in RQ after our poll task timed out (e.g. jobs 7–10
+        # queued behind 1–6). Otherwise we'd only have 6 in rendered_files and send one message.
+        await _recover_finished_batch_jobs(
+            bot,
+            channel,
+            job_ids,
+            filenames,
+            bytes_list,
+            results_list,
+            rendered_files,
+            batch_battle_stats,
+            single_message,
+        )
 
         # Sync results_list from rendered_files (don't rely on expired RQ job results)
         for i, (fn, st, link) in enumerate(results_list):
@@ -1392,21 +1772,28 @@ async def _batch_coordinator(
                     if first_parsed else "Renders"
                 )
                 any_bucket_failed = False
+                # For include_summary: continuous numbering across buckets (second message starts at 7 if first had 6)
+                summary_start_by_bucket = []
+                if buckets:
+                    acc = 0
+                    for b in buckets:
+                        summary_start_by_bucket.append(acc)
+                        acc += len(b)
                 for bucket_idx, bucket in enumerate(buckets):
                     if include_summary:
+                        start_num = summary_start_by_bucket[bucket_idx]
                         lines = [
-                            f"{idx + 1}. **{format_replay_display(results_list[i][0])}**"
+                            f"{start_num + idx + 1}. {format_replay_summary_line(results_list[i][0])}"
                             for idx, (i, _, _) in enumerate(bucket)
                         ]
-                        bucket_content = (
-                            (f"# Renders for {date_title}\n\n" if bucket_idx == 0 else "")
-                            + "\n".join(lines)
-                        )
-                        # Add win rate to the last bucket only
-                        if bucket_idx == len(buckets) - 1 and batch_battle_stats:
-                            win_rate_line = format_win_rate_line(batch_battle_stats)
-                            if win_rate_line:
-                                bucket_content += f"\n\n{win_rate_line}"
+                        header = ""
+                        if bucket_idx == 0:
+                            header = f"# Renders for {date_title}\n\n"
+                            overall = _format_summary_overall_stats(batch_battle_stats)
+                            if overall:
+                                header += overall + "\n\n"
+                            header += "**Renders (in Chronological Order)**:\n"
+                        bucket_content = header + "\n".join(lines)
                     else:
                         bucket_content = None
 
@@ -1464,23 +1851,16 @@ async def _batch_coordinator(
                         if first_parsed
                         else "Renders"
                     )
-                    summary_lines = []
-                    for i, (fn, st, link) in enumerate(results_list):
-                        display = format_replay_display(fn)
-                        line = f"{i + 1}. **{display}**: {st}"
-                        if st == "Done" and link:
-                            line += f" — [Link]({link})"
-                        elif st == "Failed" and link:
-                            line += f" — {link}"
-                        summary_lines.append(line)
-                    content = (
-                        f"# Renders for {date_title}\n\n" + "\n".join(summary_lines)
-                    )
-                    # Add win rate if battle stats are available
-                    if batch_battle_stats:
-                        win_rate_line = format_win_rate_line(batch_battle_stats)
-                        if win_rate_line:
-                            content += f"\n\n{win_rate_line}"
+                    overall = _format_summary_overall_stats(batch_battle_stats)
+                    summary_lines = [
+                        f"{i + 1}. {format_replay_summary_line(fn)}"
+                        for i, (fn, st, link) in enumerate(results_list)
+                    ]
+                    content = f"# Renders for {date_title}\n\n"
+                    if overall:
+                        content += overall + "\n\n"
+                    content += "**Renders (in Chronological Order)**:\n"
+                    content += "\n".join(summary_lines)
                     await _send_with_retry(
                         BATCH_POST_RESULT_ATTEMPTS,
                         BATCH_POST_RESULT_RETRY_DELAY_BASE,
@@ -1788,7 +2168,16 @@ class RenderCog(commands.Cog):
         bytes_list = [p[1] for p in pairs]
 
         queue = RenderSingle.QUEUE
-        job_ttl = max(queue.count + len(bytes_list), 1) * RenderSingle.MAX_WAIT_TIME
+        # Industry standard: TTL must allow ALL jobs to START (not just finish).
+        # Formula: (current queue depth + batch size) * time per job, with minimum floor.
+        batch_size = len(bytes_list)
+        job_ttl = max(
+            BATCH_JOB_TTL_MIN_SECONDS,
+            (queue.count + batch_size) * BATCH_JOB_TTL_PER_JOB_SECONDS,
+        )
+        # Industry standard: retry for transient failures.
+        # Immediate retries (no interval) work on Windows without scheduler.
+        retry_config = Retry(max=BATCH_JOB_RETRY_MAX)
         job_ids = []
         for data in bytes_list:
             job = queue.enqueue(
@@ -1804,9 +2193,10 @@ class RenderCog(commands.Cog):
                     payload["chat"],
                     payload["team_tracers"],
                 ],
-                failure_ttl=RenderSingle.FINISHED_TTL,
-                result_ttl=RenderSingle.FINISHED_TTL,
+                failure_ttl=BATCH_JOB_FAILURE_TTL_SECONDS,
+                result_ttl=BATCH_JOB_RESULT_TTL_SECONDS,
                 ttl=job_ttl,
+                retry=retry_config,
             )
             job_ids.append(job.id)
 
