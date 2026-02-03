@@ -24,6 +24,10 @@ from .urls import CLANS_API, VORTEX
 from .utils import *
 from . import wg
 
+# SECURITY: HTTP timeout configuration to prevent hanging requests (DoS mitigation)
+# Total timeout: 30 seconds, connect timeout: 10 seconds
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
 DEFAULT_BATTLE_TYPE = "pvp"
 BATTLE_TYPES = {
     "pvp": {
@@ -51,7 +55,7 @@ async def get_player(
     player_id = str(player_id)
 
     async with vortex_limit:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             url = f"{VORTEX[region]}/accounts/{player_id}/"
             params = {"ac": access_code} if access_code else None
 
@@ -114,7 +118,7 @@ async def get_clan_role(
     player_id: Union[int, str],
 ) -> Optional[ClanRole]:
     async with vortex_limit:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             url = f"{VORTEX[region]}/accounts/{player_id}/clans"
 
             async with session.get(url) as response:
@@ -142,7 +146,7 @@ async def get_ship_statistics(
     ship_id = str(ship_id)
 
     async with vortex_limit:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             url = (
                 f"{VORTEX[region]}/accounts/{player_id}/ships/{ship_id}/{battle_type}/"
             )
@@ -190,7 +194,7 @@ async def get_clan_members(
         season = wg.seasons[region].last_clan_season
 
     async with vortex_limit:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             url = f"{CLANS_API[region]}/members/{clan_id}/"
             params = {"battle_type": battle_type, "season": season}
 
@@ -212,7 +216,7 @@ async def get_clan(region: str, clan_id: Union[int, str]):
         return None
 
     async with vortex_limit:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             url = f"{CLANS_API[region]}/clanbase/{clan_id}/claninfo/"
 
             async with session.get(url) as response:
@@ -242,7 +246,7 @@ async def get_ladder_position(
     realm = REALMS[region] if local else "global"
 
     async with vortex_limit:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             url = f"{CLANS_API[region]}/ladder/structure/"
             params = {"clan_id": clan_id, "season": season, "realm": realm}
 

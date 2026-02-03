@@ -12,6 +12,8 @@ from config import cfg
 from .models import *
 from .utils import *
 
+# SECURITY: HTTP timeout configuration to prevent hanging requests (DoS mitigation)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 API = {
     "eu": "https://api.worldofwarships.eu/wows",
@@ -32,7 +34,7 @@ class WGAPIError(APIError):
 async def get_seasons():
     temp = {}
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         for region, api in API.items():
             url = f"{api}/clans/season/"
 
@@ -50,7 +52,7 @@ async def get_seasons():
 async def get_buildings():
     temp = {}
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         for region, api in API.items():
             url = f"{api}/clans/glossary/"
 
