@@ -49,6 +49,13 @@ class ShrimpyConfig:
 
     twitter = environ.group(Twitter)
 
+    @environ.config(prefix="RENDER")
+    class Render:
+        # Timezone for replay filename date/time (e.g. "America/New_York"). Used to build Discord dynamic timestamps.
+        replay_timezone = environ.var("UTC")
+
+    render = environ.group(Render)
+
 
 def _parse_owner_ids(value: str):
     return {int(x.strip()) for x in value.split(",") if x.strip()} if value else None
@@ -63,6 +70,7 @@ def _build_environ():
             os.environ.get("CHANNELS_FAILED_RENDERS", 1010834704804614184)
         ),
         "REDIS_PORT": int(os.environ.get("REDIS_PORT", 6379)),
+        "RENDER_REPLAY_TIMEZONE": os.environ.get("RENDER_REPLAY_TIMEZONE", "UTC"),
     }
     if "REDIS_PASSWORD" in os.environ:
         env["REDIS_PASSWORD"] = os.environ["REDIS_PASSWORD"]
