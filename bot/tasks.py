@@ -13,7 +13,10 @@ from renderer.render import Renderer, RenderDual, ReplayData
 from replay_parser import ReplayParser
 from rq.job import Job
 
-from bot.utils.errors import ArenaMismatchError, VersionNotFoundError
+from bot.utils.errors import ArenaMismatchError, RenderError, VersionNotFoundError
+
+# SECURITY: Maximum video output size (25 MB) to prevent Redis/memory exhaustion
+MAX_VIDEO_OUTPUT_BYTES = 25 * 1024 * 1024
 from bot.utils.replay_stats import extract_battle_stats_from_replay_info
 from config import cfg
 
@@ -107,6 +110,13 @@ def render_single(
                 render.start(tmp.name, fps, quality, progress_callback(job))
                 tmp.seek(0)
                 video_data = tmp.read()
+
+                # SECURITY: Enforce video output size limit to prevent Redis/memory exhaustion
+                if len(video_data) > MAX_VIDEO_OUTPUT_BYTES:
+                    return RenderError(
+                        f"Rendered video too large ({len(video_data) / 1024 / 1024:.1f} MB). "
+                        f"Try reducing quality or FPS."
+                    )
         except ModuleNotFoundError:
             return VersionNotFoundError()
 
@@ -197,6 +207,13 @@ def render_dual(
                 ).start(tmp.name, fps, quality, progress_callback(job))
                 tmp.seek(0)
                 video_data = tmp.read()
+
+                # SECURITY: Enforce video output size limit to prevent Redis/memory exhaustion
+                if len(video_data) > MAX_VIDEO_OUTPUT_BYTES:
+                    return RenderError(
+                        f"Rendered video too large ({len(video_data) / 1024 / 1024:.1f} MB). "
+                        f"Try reducing quality or FPS."
+                    )
         except ModuleNotFoundError:
             return VersionNotFoundError()
 
