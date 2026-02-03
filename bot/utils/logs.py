@@ -3,9 +3,9 @@ __all__ = ["logger", "handler"]
 import logging.handlers
 import os
 
-PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../logs/track.log")
+PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../logs/shrimpy.log")
 
-logger = logging.getLogger("track")
+logger = logging.getLogger("shrimpy")
 logger.setLevel(logging.INFO)
 logging.getLogger("discord").setLevel(logging.INFO)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
