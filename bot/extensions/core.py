@@ -1,8 +1,8 @@
 from typing import Union
 import collections
 import datetime
+import json
 import os
-import pickle
 
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -13,7 +13,13 @@ from bot.utils.logs import logger
 from config import cfg
 
 
+# SECURITY: Changed from pickle to JSON to avoid deserialization vulnerabilities
+# pickle.load() on untrusted data can lead to arbitrary code execution
 STATS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../assets/private/stats.json"
+)
+# Legacy path for migration
+LEGACY_STATS_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "../assets/private/stats.pickle"
 )
 CREATED = datetime.datetime.fromtimestamp(cfg.created, datetime.timezone.utc)
@@ -25,13 +31,39 @@ class Core(commands.Cog):
 
         self.session = collections.Counter()
 
-        try:
-            with open(STATS_PATH, "rb") as fp:
-                self.persistent = pickle.load(fp)
-        except FileNotFoundError:
-            self.persistent = collections.Counter()
+        # Load persistent stats from JSON (or migrate from legacy pickle)
+        self.persistent = self._load_persistent_stats()
 
         self.save_stats.start()
+
+    def _load_persistent_stats(self) -> collections.Counter:
+        """
+        Load persistent stats from JSON file.
+        Migrates from legacy pickle format if needed.
+        """
+        # Try loading from JSON first
+        try:
+            with open(STATS_PATH, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+                return collections.Counter(data)
+        except FileNotFoundError:
+            pass
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Failed to load stats.json: {e}")
+
+        # Try migrating from legacy pickle (one-time migration)
+        try:
+            import pickle
+            with open(LEGACY_STATS_PATH, "rb") as fp:
+                legacy_data = pickle.load(fp)
+                logger.info("Migrated stats from pickle to JSON format")
+                return collections.Counter(legacy_data)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to load legacy stats.pickle: {e}")
+
+        return collections.Counter()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -62,8 +94,9 @@ class Core(commands.Cog):
         if self.bot.stopping:
             return
 
-        with open(STATS_PATH, "wb") as fp:
-            pickle.dump(self.persistent, fp)
+        # SECURITY: Save as JSON instead of pickle to avoid deserialization risks
+        with open(STATS_PATH, "w", encoding="utf-8") as fp:
+            json.dump(dict(self.persistent), fp, indent=2)
 
     @commands.Cog.listener()
     async def on_app_command_completion(
