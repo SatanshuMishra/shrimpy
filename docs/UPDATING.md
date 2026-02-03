@@ -15,33 +15,27 @@ python run.py --sync
 
 ### Updating resources
 
-1. Track relies on unpacked game files at each game update. 
-To begin, install the WoWS Unpacker utility available 
-[here](https://forum.worldofwarships.eu/topic/113847-all-wows-unpack-tool-unpack-game-client-resources/).
+1. Track relies on unpacked game files at each game update. Install the WoWS Unpacker utility
+available [here](https://forum.worldofwarships.eu/topic/113847-all-wows-unpack-tool-unpack-game-client-resources/).
 
-
-2. Move `scripts/extract.py` to the root of your WoWS installation, and run it.
+2. Run the end-to-end update pipeline from the repo root:
 
 ```shell
-python scripts/extract.py
+python scripts/update_resources.py --wows-root "C:\Games\World_of_Warships"
 ```
 
-3. This will create `res_extract/` in the root directory. 
-Move `GameParams.data`, located in `res_extract/content`, to `resources/`.
-Move `texts`, located in `res_extract/`, to `resources/` as well.
-Move `ships_silhouettes`, located in `res_extract/gui`, to `bot/assets/public/`.
+Notes:
+- Use the venv Python if the bot uses it:
+  `.\.venv\Scripts\python.exe scripts/update_resources.py --wows-root "C:\Games\World_of_Warships"`
+- The script clones/updates `minimap_renderer` and `FilteredGameParams2Json` into `tools/`.
+- It unpacks `GameParams.data`, `texts`, and `ships_silhouettes`, generates renderer data
+  (including `abilities.json`), and regenerates `ships.json`.
+- If the renderer package path cannot be auto-detected, pass `--renderer-target`.
 
-
-4. Run `scripts/ships/generate.py`.
-
-```shell
-python scripts/ships/generate.py
-```
-
-5. This will generate `ships.json` in `generated/`. Compare it the previous version by running `scripts/ships/compare.py`.
+3. Compare ship changes:
 
 ```shell
 python scripts/ships/compare.py
 ```
 
-6. Update `bot/assets/public/guess.toml` as appropriate, and then move `ships.json` to `bot/assets/public/`.
+4. Update `bot/assets/public/guess.toml` as appropriate.
