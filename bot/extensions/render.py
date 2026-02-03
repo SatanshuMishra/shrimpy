@@ -37,6 +37,7 @@ from discord.ext import commands
 from bot import tasks
 from bot.track import Track
 from bot.utils import errors, functions
+from bot.utils.replay_stats import BattleStats, format_win_rate_line
 from config import cfg
 
 logger = logging.getLogger("track")
@@ -466,7 +467,9 @@ class Render:
                         continue
 
                     if isinstance(self._job.result, tuple):
-                        data, result_fn, time_taken, builds_str, chat = self._job.result
+                        # Unpack 5 or 6 elements (6th is battle_stats, unused in single render)
+                        data, result_fn, time_taken, builds_str, chat = self._job.result[:5]
+                        # battle_stats = self._job.result[5] if len(self._job.result) >= 6 else None
 
                         try:
                             file = discord.File(io.BytesIO(data), f"{result_fn}.mp4")
@@ -777,6 +780,21 @@ def _format_render_summary(filename: Optional[str]) -> Optional[str]:
     )
 
 
+def _batch_progress_footer(done: int, total: int) -> str:
+    """Build footer text for batch processing embed: progress bar + 'done/total replays'."""
+    width = 10
+    if total <= 0:
+        filled, empty = 0, width
+    else:
+        filled = min(width, round((done / total) * width))
+        empty = width - filled
+    bar = (
+        f"{Render.PROGRESS_FOREGROUND * filled}"
+        f"{Render.PROGRESS_BACKGROUND * empty}"
+    )
+    return f"{bar} {done}/{total} replays"
+
+
 class RenderEmbed(discord.Embed):
     TITLE_STARTING = "Render Process Starting"
     TITLE_PROCESSING = "Render Processing"
@@ -990,10 +1008,12 @@ async def _poll_single_batch_job(
     lock: asyncio.Lock,
     single_message: bool = False,
     rendered_files: Optional[list] = None,
+    batch_battle_stats: Optional[list] = None,
 ) -> None:
     """
     Poll ONE batch job until it finishes/fails.
     Updates results_list[job_index] and the status embed.
+    Also stores BattleStats in batch_battle_stats[job_index] if provided.
     Does NOT handle combined send or cleanup (coordinator does that).
     """
     # Run sync RQ call in executor to avoid blocking event loop
@@ -1015,7 +1035,11 @@ async def _poll_single_batch_job(
             async with lock:
                 if status == "finished" and job.result:
                     if isinstance(job.result, tuple):
-                        data, out_name, time_taken, builds_str, chat = job.result
+                        # Unpack 5 or 6 elements (6th is battle_stats)
+                        data, out_name, time_taken, builds_str, chat = job.result[:5]
+                        battle_stats = job.result[5] if len(job.result) >= 6 else None
+                        if batch_battle_stats is not None:
+                            batch_battle_stats[job_index] = battle_stats
                         if rendered_files is not None:
                             rendered_files[job_index] = (out_name, data)
                         if single_message:
@@ -1127,6 +1151,13 @@ async def _poll_single_batch_job(
                     color=color,
                     description="\n".join(desc_lines),
                 )
+                if title == RenderEmbed.BATCH_TITLE_PROCESSING:
+                    done_count = sum(
+                        1 for _, st, _ in results_list if st != "Queued"
+                    )
+                    embed.set_footer(
+                        text=_batch_progress_footer(done_count, total)
+                    )
                 try:
                     await status_message.edit(embed=embed)
                 except Exception as e:
@@ -1152,11 +1183,13 @@ async def _batch_coordinator(
     application_id: Optional[str],
     files_message_id: int,
     rendered_files: Optional[list],
+    batch_battle_stats: Optional[list] = None,
 ) -> None:
     """
     Coordinator: spawn poll tasks, wait for ALL to complete, then send and cleanup.
     Cleanup (task_request, cooldown, temp dir) ALWAYS runs in finally so the bot
     stays usable even when delivery fails.
+    Also collects battle stats for win rate calculation when include_summary is True.
     """
     lock = asyncio.Lock()
     total = len(job_ids)
@@ -1179,6 +1212,7 @@ async def _batch_coordinator(
                     lock,
                     single_message,
                     rendered_files,
+                    batch_battle_stats,
                 )
             )
             for i, (job_id, filename, replay_bytes) in enumerate(
@@ -1289,6 +1323,11 @@ async def _batch_coordinator(
                             (f"# Renders for {date_title}\n\n" if bucket_idx == 0 else "")
                             + "\n".join(lines)
                         )
+                        # Add win rate to the last bucket only
+                        if bucket_idx == len(buckets) - 1 and batch_battle_stats:
+                            win_rate_line = format_win_rate_line(batch_battle_stats)
+                            if win_rate_line:
+                                bucket_content += f"\n\n{win_rate_line}"
                     else:
                         bucket_content = None
 
@@ -1358,6 +1397,11 @@ async def _batch_coordinator(
                     content = (
                         f"# Renders for {date_title}\n\n" + "\n".join(summary_lines)
                     )
+                    # Add win rate if battle stats are available
+                    if batch_battle_stats:
+                        win_rate_line = format_win_rate_line(batch_battle_stats)
+                        if win_rate_line:
+                            content += f"\n\n{win_rate_line}"
                     await _send_with_retry(
                         BATCH_POST_RESULT_ATTEMPTS,
                         BATCH_POST_RESULT_RETRY_DELAY_BASE,
@@ -1375,10 +1419,16 @@ async def _batch_coordinator(
             elif st == "Failed" and link:
                 line += f" — {link}"
             desc_lines.append(line)
+        final_desc = "\n".join(desc_lines)
+        # Add win rate to final embed when include_summary is True
+        if include_summary and batch_battle_stats:
+            win_rate_line = format_win_rate_line(batch_battle_stats)
+            if win_rate_line:
+                final_desc += f"\n\n{win_rate_line}"
         embed = discord.Embed(
             title=RenderEmbed.TITLE_SUMMARY,
             color=RenderEmbed.BATCH_COLOR_COMPLETE,
-            description="\n".join(desc_lines),
+            description=final_desc,
         )
         try:
             await status_message.edit(embed=embed)
@@ -1685,6 +1735,7 @@ class RenderCog(commands.Cog):
         single_message = payload.get("single_message", False)
         include_summary = payload.get("include_summary", False)
         rendered_files = [None] * len(replays)
+        batch_battle_stats: list[Optional[BattleStats]] = [None] * len(replays)
         desc_lines = [
             f"{i + 1}. **{format_replay_display(fn)}**: Queued"
             for i, fn in enumerate(filenames)
@@ -1694,6 +1745,7 @@ class RenderCog(commands.Cog):
             color=RenderEmbed.BATCH_COLOR_PROCESSING,
             description=f"Batch queued: **{len(replays)}** replays.\n\n" + "\n".join(desc_lines),
         )
+        embed.set_footer(text=_batch_progress_footer(0, len(replays)))
         prompt_message = await message.channel.fetch_message(ref_id)
         await prompt_message.edit(embed=embed)
 
@@ -1717,6 +1769,7 @@ class RenderCog(commands.Cog):
                 application_id,
                 message.id,
                 rendered_files,
+                batch_battle_stats,
             )
         )
         return True

@@ -14,6 +14,7 @@ from replay_parser import ReplayParser
 from rq.job import Job
 
 from bot.utils.errors import ArenaMismatchError, VersionNotFoundError
+from bot.utils.replay_stats import extract_battle_stats_from_replay_info
 from config import cfg
 
 _url = f"redis://:{cfg.redis.password}@{cfg.redis.host}:{cfg.redis.port}/"
@@ -137,6 +138,9 @@ def render_single(
 
             chat += f"[{battle_time // 60:02}:{battle_time % 60:02}] {clan_tag}{name}: {message.message}\n"
 
+    # Extract battle statistics for win/loss tracking (modular, reusable)
+    battle_stats = extract_battle_stats_from_replay_info(replay_info)
+
     if requester_id:
         _redis.set(f"cooldown_{requester_id}", "", ex=cooldown)
     return (
@@ -145,6 +149,7 @@ def render_single(
         time_taken,
         json.dumps(render.get_player_build()),
         chat,
+        battle_stats,  # 6th element: BattleStats or None
     )
 
 
@@ -205,4 +210,5 @@ def render_dual(
 
     if requester_id:
         _redis.set(f"cooldown_{requester_id}", "", ex=cooldown)
-    return video_data, f"render_{green_name}_{red_name}_{name}", time_taken, "", ""
+    # Dual renders don't have meaningful single-player stats; return None for consistency
+    return video_data, f"render_{green_name}_{red_name}_{name}", time_taken, "", "", None
