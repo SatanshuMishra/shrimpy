@@ -8,7 +8,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import discord
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils.logs import logger
 from config import cfg
 
@@ -20,8 +20,8 @@ CREATED = datetime.datetime.fromtimestamp(cfg.created, datetime.timezone.utc)
 
 
 class Core(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
         self.session = collections.Counter()
 
@@ -96,5 +96,5 @@ class Core(commands.Cog):
         )
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(Core(bot))

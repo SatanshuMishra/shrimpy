@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils.logs import logger
 
 GUILD_IDS = [
@@ -30,8 +30,8 @@ with open(_PASTAS_PATH, "r") as fp:
 
 
 class BukiCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
         self.emojis: Optional[dict] = None
 
         self.load_emojis.start()
@@ -102,5 +102,5 @@ class BukiCog(commands.Cog):
         await interaction.response.send_message(PASTAS[num - 1])
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(BukiCog(bot))

@@ -5,7 +5,7 @@ from discord import app_commands
 import discord
 
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import db
 
 
@@ -38,8 +38,8 @@ class UserDataEmbed(discord.Embed):
 
 
 class GeneralCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
         self.permissions = discord.Permissions(412317248576)
         self.bot.remove_command("help")
@@ -89,5 +89,5 @@ class GeneralCog(commands.Cog):
         await interaction.response.send_message(HELP_MESSAGE, ephemeral=True)
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(GeneralCog(bot))

@@ -116,7 +116,7 @@ class CustomTree(app_commands.CommandTree):
             logs.logger.error(f"Namespace: {interaction.namespace}")
 
 
-class Track(commands.AutoShardedBot):
+class Shrimpy(commands.AutoShardedBot):
     def __init__(self, sync: bool = False):
         super().__init__(
             command_prefix=cfg.discord.default_prefix,

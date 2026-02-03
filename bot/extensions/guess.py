@@ -13,7 +13,7 @@ from discord import app_commands, ui
 import discord
 from sqlalchemy import select
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import assets, db, errors, wows
 
 
@@ -250,8 +250,8 @@ class GuessGame:
 
 
 class GuessCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
         with open(CONFIG_PATH) as fp:
             self.config = toml.load(fp)
 
@@ -405,5 +405,5 @@ class GuessCog(commands.Cog):
         )
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(GuessCog(bot))

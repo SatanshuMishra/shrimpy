@@ -7,12 +7,12 @@ import discord
 from bot.utils import assets
 
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 
 
 class FunCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
     @app_commands.command(
         name="aah", description="Monday is coming", extras={"category": "fun"}
@@ -29,5 +29,5 @@ class FunCog(commands.Cog):
         await interaction.response.send_message(assets.get("POGGERS"))
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(FunCog(bot))

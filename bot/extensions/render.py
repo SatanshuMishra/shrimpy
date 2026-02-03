@@ -35,12 +35,12 @@ from discord import app_commands, ui
 from discord.ext import commands
 
 from bot import tasks
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import errors, functions
 from bot.utils.replay_stats import BattleStats, format_win_rate_line
 from config import cfg
 
-logger = logging.getLogger("track")
+logger = logging.getLogger("shrimpy")
 _url = f"redis://:{cfg.redis.password}@{cfg.redis.host}:{cfg.redis.port}/"
 _redis: redis.Redis = redis.from_url(_url)
 _async_redis: redis.asyncio.Redis = redis.asyncio.from_url(_url)
@@ -290,7 +290,7 @@ class BuildsButton(ui.Button):
         for build in builds:
             if clan := build["clan"]:
                 self.fp.write(f"[{clan}] ")
-            self.fp.write(build["name"] + " (" + build["ship"] + ")\n" + build["build_url"] + "&ref=track" + "\n\n")
+            self.fp.write(build["name"] + " (" + build["ship"] + ")\n" + build["build_url"] + "&ref=shrimpy" + "\n\n")
         self.fp.seek(0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -320,7 +320,7 @@ class RenderView(ui.View):
 
         for build in builds:
             if build["relation"] == -1 and build["build_url"]:
-                url = build["build_url"] + "&ref=track"
+                url = build["build_url"] + "&ref=shrimpy"
                 if len(url) <= URL_MAX_LENGTH:
                     self.add_item(ui.Button(label="Player Build", url=url))
                 break
@@ -351,7 +351,7 @@ class Render:
 
     QUEUE: rq.Queue
 
-    def __init__(self, bot: Track, interaction: Optional[discord.Interaction]):
+    def __init__(self, bot: Shrimpy, interaction: Optional[discord.Interaction]):
         self._bot = bot
         self._interaction = interaction
         self._job: Optional[rq.job.Job] = None
@@ -566,7 +566,7 @@ class RenderSingle(Render):
 
     def __init__(
         self,
-        bot: Track,
+        bot: Shrimpy,
         interaction: discord.Interaction,
         attachment: discord.Attachment,
     ):
@@ -628,7 +628,7 @@ class RenderDual(Render):
 
     def __init__(
         self,
-        bot: Track,
+        bot: Shrimpy,
         interaction: discord.Interaction,
         attachment1: discord.Attachment,
         attachment2: discord.Attachment,
@@ -699,7 +699,7 @@ class RenderWT(Render):
 
     def __init__(
         self,
-        bot: Track,
+        bot: Shrimpy,
         data1: bytes,
         data2: bytes,
         output_channel: int,
@@ -938,7 +938,7 @@ async def _send_ephemeral_followup(
 
 
 async def _edit_batch_prompt_to_timeout(
-    bot: Track,
+    bot: Shrimpy,
     channel: discord.abc.Messageable,
     message_id: int,
 ) -> None:
@@ -996,7 +996,7 @@ async def _batch_check(
 
 
 async def _poll_single_batch_job(
-    bot: Track,
+    bot: Shrimpy,
     channel: discord.abc.Messageable,
     status_message: discord.Message,
     job_id: str,
@@ -1169,7 +1169,7 @@ async def _poll_single_batch_job(
 
 
 async def _batch_coordinator(
-    bot: Track,
+    bot: Shrimpy,
     channel: discord.abc.Messageable,
     status_message: discord.Message,
     job_ids: list,
@@ -1532,8 +1532,8 @@ async def _batch_coordinator(
 
 
 class RenderCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
     @app_commands.command(
         name="render",
@@ -1811,6 +1811,6 @@ class RenderCog(commands.Cog):
         await render.start(*[replay["tag"].upper() for replay in data["replays"]])
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(RenderCog(bot))
     await _async_redis.config_set("notify-keyspace-events", "KEA")

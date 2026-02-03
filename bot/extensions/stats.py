@@ -8,7 +8,7 @@ from discord import app_commands, ui
 import discord
 
 import api
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import assets, db, wows
 from bot.utils.logs import logger
 
@@ -470,8 +470,8 @@ class ShipStatisticsEmbed(StatisticsEmbedCommon):
 
 
 class StatsCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
         self.load_seasons.start()
 
@@ -626,5 +626,5 @@ class StatsCog(commands.Cog):
             view.message = await interaction.followup.send(embed=embed, view=view)
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(StatsCog(bot))

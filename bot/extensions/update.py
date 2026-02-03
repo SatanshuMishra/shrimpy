@@ -8,7 +8,7 @@ import discord
 import requests
 
 import api
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils.logs import logger
 
 
@@ -69,7 +69,7 @@ def scrape():
 
 
 class UpdateCog(commands.Cog):
-    def __init__(self, bot: Track):
+    def __init__(self, bot: Shrimpy):
         self.bot = bot
 
         self.update_data = {}
@@ -115,5 +115,5 @@ class UpdateCog(commands.Cog):
             )
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(UpdateCog(bot))

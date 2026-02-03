@@ -3,12 +3,12 @@ from typing import Literal, Optional
 from discord.ext import commands
 import discord
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 
 
 class OwnerCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
     @commands.command()
     @commands.is_owner()
@@ -66,5 +66,5 @@ class OwnerCog(commands.Cog):
         await ctx.send(f"Synced the tree to {ret}/{len(guilds)}.")
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(OwnerCog(bot))

@@ -8,7 +8,7 @@ import discord
 from sqlalchemy import select
 
 import api
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import db
 
 
@@ -137,8 +137,8 @@ class LinkView(ui.View):
 
 
 class LinkCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
 
     @app_commands.command(
         name="link",
@@ -162,5 +162,5 @@ class LinkCog(commands.Cog):
         view.message = await interaction.original_response()
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(LinkCog(bot))

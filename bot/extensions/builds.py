@@ -6,7 +6,7 @@ from discord.ext import commands
 from discord import app_commands, ui
 import discord
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import wows
 
 
@@ -42,8 +42,8 @@ class BuildsView(ui.View):
 
 
 class BuildsCog(commands.Cog):
-    def __init__(self, bot: Track):
-        self.bot: Track = bot
+    def __init__(self, bot: Shrimpy):
+        self.bot: Shrimpy = bot
         with open(BUILDS_PATH, encoding='utf-8') as fp:
             data = toml.load(fp)
             self.builds = {
@@ -76,5 +76,5 @@ class BuildsCog(commands.Cog):
             )
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(BuildsCog(bot))

@@ -8,7 +8,7 @@ ini_secrets = environ.secrets.INISecrets.from_path(SECRETS_PATH, ENVIRONMENT)
 
 
 @environ.config(prefix="")
-class TrackConfig:
+class ShrimpyConfig:
     created = environ.var(converter=int)
 
     @environ.config(prefix="DISCORD")
@@ -50,11 +50,18 @@ class TrackConfig:
     twitter = environ.group(Twitter)
 
 
+def _parse_owner_ids(value: str):
+    return {int(x.strip()) for x in value.split(",") if x.strip()} if value else None
+
+
 def _build_environ():
     env = {
-        "CREATED": 1663989263,
-        "DISCORD_OWNER_IDS": {212466672450142208, 113104128783159296},
-        "CHANNELS_FAILED_RENDERS": 1010834704804614184,
+        "CREATED": int(os.environ.get("CREATED", 1663989263)),
+        "DISCORD_OWNER_IDS": _parse_owner_ids(os.environ.get("DISCORD_OWNER_IDS", ""))
+        or {212466672450142208, 113104128783159296},
+        "CHANNELS_FAILED_RENDERS": int(
+            os.environ.get("CHANNELS_FAILED_RENDERS", 1010834704804614184)
+        ),
         "REDIS_PORT": int(os.environ.get("REDIS_PORT", 6379)),
     }
     if "REDIS_PASSWORD" in os.environ:
@@ -64,4 +71,4 @@ def _build_environ():
     return env
 
 
-cfg: TrackConfig = TrackConfig.from_environ(environ=_build_environ())
+cfg: ShrimpyConfig = ShrimpyConfig.from_environ(environ=_build_environ())

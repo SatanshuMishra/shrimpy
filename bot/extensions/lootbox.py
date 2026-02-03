@@ -13,7 +13,7 @@ from discord import app_commands
 import discord
 import requests
 
-from bot.track import Track
+from bot.shrimpy import Shrimpy
 from bot.utils import errors
 from bot.utils.logs import logger
 
@@ -216,7 +216,7 @@ class WoWSObject:
 
 
 class LootboxCog(commands.Cog):
-    def __init__(self, bot: Track):
+    def __init__(self, bot: Shrimpy):
         self.bot = bot
 
         self.box_names = {}
@@ -402,5 +402,5 @@ class LootboxCog(commands.Cog):
                     await interaction.followup.send("Result too long for Discord.")
 
 
-async def setup(bot: Track):
+async def setup(bot: Shrimpy):
     await bot.add_cog(LootboxCog(bot))
