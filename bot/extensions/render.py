@@ -48,6 +48,58 @@ _async_redis: redis.asyncio.Redis = redis.asyncio.from_url(_url)
 UNKNOWN_JOB_STATUS_RETRY = 5
 URL_MAX_LENGTH = 512
 BATCH_MAX_REPLAYS = 10  # Discord message attachment limit
+
+# SECURITY: HTTP timeout configuration to prevent hanging requests (DoS mitigation)
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=10)
+
+# SECURITY: Maximum file size for replay downloads (50 MB) to prevent DoS/memory exhaustion
+MAX_REPLAY_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+# SECURITY: Maximum replay attachment size (50 MB) - replays are typically < 5 MB
+MAX_REPLAY_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+# SECURITY: Maximum video output size (25 MB) to prevent Redis/memory exhaustion
+# This matches Discord's max message total; individual files can be 8 MB
+MAX_VIDEO_OUTPUT_BYTES = 25 * 1024 * 1024
+
+# SECURITY: Allowed domains for tournament replay URLs (SSRF mitigation)
+# Only these domains are permitted for automatic URL fetching from messages
+ALLOWED_REPLAY_DOMAINS = frozenset({
+    "wows-tournaments.com",
+    "api.wows-tournaments.com",
+    "cdn.wows-tournaments.com",
+    "replays.wows-numbers.com",
+    "replayswows.com",
+})
+
+# SECURITY: Allowed domains for callback URLs (SSRF/exfiltration mitigation)
+ALLOWED_CALLBACK_DOMAINS = frozenset({
+    "wows-tournaments.com",
+    "api.wows-tournaments.com",
+})
+
+
+def _is_url_allowed(url: str, allowed_domains: frozenset) -> bool:
+    """
+    SECURITY: Validate that a URL's domain is in the allowlist.
+    Prevents SSRF attacks by blocking requests to internal IPs, cloud metadata, etc.
+    """
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        # Check if the hostname matches or is a subdomain of any allowed domain
+        host_lower = host.lower()
+        for domain in allowed_domains:
+            if host_lower == domain or host_lower.endswith(f".{domain}"):
+                return True
+        return False
+    except Exception:
+        return False
 BATCH_PENDING_PREFIX = "renderbatch_pending:"
 BATCH_PENDING_TTL = 60  # seconds to reply with files before prompt shows timeout
 BATCH_POST_RESULT_ATTEMPTS = 5
@@ -68,7 +120,7 @@ async def _get_http_session() -> aiohttp.ClientSession:
     """Get or create the shared aiohttp session for webhook requests."""
     global _http_session
     if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
+        _http_session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
     return _http_session
 
 # Exceptions that indicate transient network/SSL errors and warrant retry
@@ -601,6 +653,16 @@ class RenderSingle(Render):
         if not await self._check():
             return
 
+        # SECURITY: Validate attachment size to prevent DoS/memory exhaustion
+        if self._attachment.size > MAX_REPLAY_ATTACHMENT_BYTES:
+            await functions.reply(
+                self._interaction,
+                f"Replay file too large ({self._attachment.size / 1024 / 1024:.1f} MB). "
+                f"Maximum allowed: {MAX_REPLAY_ATTACHMENT_BYTES / 1024 / 1024:.0f} MB.",
+                ephemeral=True,
+            )
+            return
+
         await self._interaction.response.defer()
 
         with io.BytesIO() as fp:
@@ -666,6 +728,17 @@ class RenderDual(Render):
 
     async def start(self, *args) -> None:
         if not await self._check():
+            return
+
+        # SECURITY: Validate attachment sizes to prevent DoS/memory exhaustion
+        total_size = self._attachment1.size + self._attachment2.size
+        if total_size > MAX_REPLAY_ATTACHMENT_BYTES * 2:
+            await functions.reply(
+                self._interaction,
+                f"Combined replay files too large ({total_size / 1024 / 1024:.1f} MB). "
+                f"Maximum allowed: {MAX_REPLAY_ATTACHMENT_BYTES * 2 / 1024 / 1024:.0f} MB.",
+                ephemeral=True,
+            )
             return
 
         await self._interaction.response.defer()
@@ -740,6 +813,12 @@ class RenderWT(Render):
 
     async def on_success(self, data: bytes, message: discord.Message) -> None:
         if self.callback_url:
+            # SECURITY: Validate callback URL is in the allowlist (SSRF mitigation)
+            if not _is_url_allowed(self.callback_url, ALLOWED_CALLBACK_DOMAINS):
+                logger.warning(
+                    "Blocked callback to non-allowlisted URL: %s", self.callback_url
+                )
+                return
             session = await _get_http_session()
             await session.post(
                 f"{self.callback_url}&messageId={message.id}",
@@ -1796,10 +1875,42 @@ class RenderCog(commands.Cog):
 
         files = []
 
-        async with aiohttp.ClientSession() as session:
+        # SECURITY: Validate all replay URLs and callback URL before processing
+        callback_url = data.get("callbackUrl", "")
+        if callback_url and not _is_url_allowed(callback_url, ALLOWED_CALLBACK_DOMAINS):
+            logger.warning(
+                "Tournament render blocked: callback URL not allowed: %s", callback_url
+            )
+            await message.add_reaction("❌")
+            return
+
+        for replay in data.get("replays", []):
+            replay_url = replay.get("replay", "")
+            if not _is_url_allowed(replay_url, ALLOWED_REPLAY_DOMAINS):
+                logger.warning(
+                    "Tournament render blocked: replay URL not allowed: %s", replay_url
+                )
+                await message.add_reaction("❌")
+                return
+
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             for replay in data["replays"]:
                 async with session.get(replay["replay"]) as response:
-                    files.append(await response.read())
+                    # SECURITY: Enforce size limit to prevent DoS/memory exhaustion
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > MAX_REPLAY_DOWNLOAD_BYTES:
+                        logger.warning(
+                            "Tournament replay too large: %s bytes", content_length
+                        )
+                        await message.add_reaction("❌")
+                        return
+                    # Read with size limit (streaming)
+                    data_bytes = await response.content.read(MAX_REPLAY_DOWNLOAD_BYTES + 1)
+                    if len(data_bytes) > MAX_REPLAY_DOWNLOAD_BYTES:
+                        logger.warning("Tournament replay exceeded size limit during read")
+                        await message.add_reaction("❌")
+                        return
+                    files.append(data_bytes)
 
         render = RenderWT(
             self.bot,
