@@ -174,7 +174,14 @@ class Shrimpy(commands.AutoShardedBot):
                         logs.logger.warning(message)
                         pass
 
-        await self.load_extension("jishaku")
+        # SECURITY: Only load jishaku in development/testing environments
+        # jishaku provides powerful eval/debug commands that could be abused if
+        # the bot token or owner account is compromised
+        if os.environ.get("ENVIRONMENT", "testing") != "production":
+            await self.load_extension("jishaku")
+            logs.logger.info("Loaded jishaku (development mode)")
+        else:
+            logs.logger.info("Skipped jishaku (production mode)")
 
     @property
     def created_on(self) -> datetime:
