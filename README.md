@@ -1,6 +1,6 @@
-## Track
+## Shrimpy
 
-Track is a Discord bot with World of Warships utilities.
+Shrimpy is a Discord bot with World of Warships utilities.
 
 For a list of features, see the [commands reference](https://github.com/padtrack/track/wiki/Commands) in the wiki.
 
@@ -8,47 +8,21 @@ For a list of features, see the [commands reference](https://github.com/padtrack
 
 ### Installation
 
+**Quick summary:** Python 3.10+, Redis, FFmpeg. Clone → create and activate a **virtual environment** (`.venv`) → `pip install -r requirements.txt` → copy `secrets_template.ini` to `secrets.ini` → run `python bot/utils/db.py` → start Redis → run bot and worker.
 
-1. Get Python 3.10 or higher
+For a **step-by-step guide** (including troubleshooting), see **[docs/INSTALL.md](docs/INSTALL.md)**.
 
-A virtual environment can be created with `python3.10 -m venv venv`.
+| Step | Command / action |
+|------|------------------|
+| 1 | Python 3.10+; create virtual env: `python -m venv .venv` then activate (e.g. `.\.venv\Scripts\Activate.ps1` on Windows) |
+| 2 | Clone repo, `cd track` |
+| 3 | `pip install -U pip` then `pip install -r requirements.txt` |
+| 4 | Copy `secrets_template.ini` → `secrets.ini` and fill in Discord token, Redis, WG app id |
+| 5 | `python bot/utils/db.py` (from repo root) |
+| 6 | Install and start [Redis](https://redis.io/docs/getting-started/); install [FFmpeg](https://ffmpeg.org/) |
+| 7 | Run bot: `python -m bot.run` (and worker: `python -m bot.worker -q single dual`) or use `.\scripts\dev.ps1 start` |
 
-2. Clone the repository
-
-```
-git clone https://github.com/SatanshuMishra/shrimpy.git
-```
-
-3. Install dependencies
-
-```
-cd track
-pip install -U -r requirements.txt
-```
-
-4. Set up the database
-
-```
-python bot/utils/db.py
-```
-
-5. Create a `secrets.ini` file from `secrets_template.ini`
-
-For more information about creating a Discord applications, see [this article](https://discordpy.readthedocs.io/en/stable/discord.html).
-
-6. Install Redis
-
-For more information, see [this article](https://redis.io/docs/getting-started/).
-
-7. Install FFmpeg
-
-For more information, see [this website](https://ffmpeg.org/).
-
-8. Configure the project in `config.py`
-
-Most of these can be left unchanged, but it is highly advised to change the values at the bottom.
-
-9. You're set! For information about updating the bot between game updates, see [here](docs/UPDATING.md).
+For updating the bot between game updates, see [docs/UPDATING.md](docs/UPDATING.md).
 
 ---
 
@@ -88,8 +62,8 @@ A utility script `scripts/dev.ps1` provides convenient commands for development:
 | `stop` | Stop Bot and Worker (idempotent; works across sessions) |
 | `restart` | Stop all, ensure Redis, flush queues, and start fresh |
 | `status` | Show status of all services (PID-based; works from any terminal) |
-| `logs` | Stream bot logs from `generated/track-bot.log` (Ctrl+C to stop) |
-| `worker-logs` | Stream worker logs from `generated/track-worker.log` (Ctrl+C to stop) |
+| `logs` | Stream bot logs from `generated/shrimpy-bot.log` (Ctrl+C to stop) |
+| `worker-logs` | Stream worker logs from `generated/shrimpy-worker.log` (Ctrl+C to stop) |
 | `flush` | Flush all Redis queues |
 | `help` | Show help message |
 
@@ -122,8 +96,8 @@ If you prefer running commands manually:
 
 **Start Redis (Docker):**
 ```powershell
-docker start redis-track
-# Or create new: docker run -d --name redis-track -p 6380:6379 redis:latest redis-server --requirepass track
+docker start redis-shrimpy
+# Or create new: docker run -d --name redis-shrimpy -p 6380:6379 redis:latest redis-server --requirepass shrimpy
 ```
 
 **Start Bot:**
@@ -143,13 +117,13 @@ $env:SYNC_GUILD_ID="YOUR_GUILD_ID"; $env:REDIS_PORT="6380"; python bot/run.py --
 
 **Flush Redis Queues:**
 ```powershell
-docker exec redis-track redis-cli -a track FLUSHALL
+docker exec redis-shrimpy redis-cli -a shrimpy FLUSHALL
 ```
 
 **Check Service Status:**
 ```powershell
 .\scripts\dev.ps1 status
-# Or for Redis only: docker ps --filter "name=redis-track"
+# Or for Redis only: docker ps --filter "name=redis-shrimpy"
 ```
 
 ---
@@ -162,7 +136,7 @@ If you run a modified version of this bot for other users (e.g. as a hosted Disc
 the AGPLv3 generally requires that those users be able to obtain the Corresponding Source
 for the version you are running.
 
-This repository originated from `padtrack/track` (`https://github.com/padtrack/track`) and includes modifications.
+This repository originated from `padtrack/track` (`https://github.com/padtrack/track`) and includes modifications. The app is now named Shrimpy.
 
 ---
 

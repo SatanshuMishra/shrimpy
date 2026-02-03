@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Development utility script for Track Discord Bot
+    Development utility script for Shrimpy Discord Bot
 
 .DESCRIPTION
     Provides commands to manage the bot, worker, and Redis services.
@@ -29,17 +29,17 @@ param(
 # Configuration
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RedisPort = if ($env:REDIS_PORT) { $env:REDIS_PORT } else { "6380" }
-$RedisContainer = "redis-track"
-$RedisPassword = "track"
+$RedisContainer = "redis-shrimpy"
+$RedisPassword = "shrimpy"
 
 # PID and log paths (process-based lifecycle; survives session boundaries)
 $GeneratedDir = Join-Path $ProjectRoot "generated"
-$PidFileBot = Join-Path $GeneratedDir "track-bot.pid"
-$PidFileWorker = Join-Path $GeneratedDir "track-worker.pid"
-$LogFileBot = Join-Path $GeneratedDir "track-bot.log"
-$LogFileBotErr = Join-Path $GeneratedDir "track-bot.err"
-$LogFileWorker = Join-Path $GeneratedDir "track-worker.log"
-$LogFileWorkerErr = Join-Path $GeneratedDir "track-worker.err"
+$PidFileBot = Join-Path $GeneratedDir "shrimpy-bot.pid"
+$PidFileWorker = Join-Path $GeneratedDir "shrimpy-worker.pid"
+$LogFileBot = Join-Path $GeneratedDir "shrimpy-bot.log"
+$LogFileBotErr = Join-Path $GeneratedDir "shrimpy-bot.err"
+$LogFileWorker = Join-Path $GeneratedDir "shrimpy-worker.log"
+$LogFileWorkerErr = Join-Path $GeneratedDir "shrimpy-worker.err"
 
 function Write-ColorOutput($ForegroundColor, $Message) {
     $fc = $host.UI.RawUI.ForegroundColor
@@ -267,7 +267,7 @@ function Watch-Logs {
 
 function Show-Help {
     Write-Output ""
-    Write-Output "Track Bot Development Utilities"
+    Write-Output "Shrimpy Bot Development Utilities"
     Write-Output "================================"
     Write-Output ""
     Write-Output "Usage: .\scripts\dev.ps1 <action>"
@@ -278,8 +278,8 @@ function Show-Help {
     Write-Output "  stop         Stop Bot and Worker (idempotent; works across sessions)"
     Write-Output "  restart      Stop all, ensure Redis, flush queues, start fresh"
     Write-Output "  status       Show status of all services (PID-based)"
-    Write-Output "  logs         Stream bot logs (generated/track-bot.log)"
-    Write-Output "  worker-logs  Stream worker logs (generated/track-worker.log)"
+    Write-Output "  logs         Stream bot logs (generated/shrimpy-bot.log)"
+    Write-Output "  worker-logs  Stream worker logs (generated/shrimpy-worker.log)"
     Write-Output "  flush        Flush all Redis queues"
     Write-Output "  help         Show this help message"
     Write-Output ""
@@ -325,10 +325,10 @@ switch ($Action) {
         Get-ServiceStatus
     }
     "logs" {
-        Watch-Logs -LogFilePath $LogFileBot -Label "TrackBot"
+        Watch-Logs -LogFilePath $LogFileBot -Label "ShrimpyBot"
     }
     "worker-logs" {
-        Watch-Logs -LogFilePath $LogFileWorker -Label "TrackWorker"
+        Watch-Logs -LogFilePath $LogFileWorker -Label "ShrimpyWorker"
     }
     "flush" {
         Flush-Queue

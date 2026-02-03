@@ -15,7 +15,7 @@ python run.py --sync
 
 ### Updating resources
 
-1. Track relies on unpacked game files at each game update. Install the WoWS Unpacker utility
+1. Shrimpy relies on unpacked game files at each game update. Install the WoWS Unpacker utility
 available [here](https://forum.worldofwarships.eu/topic/113847-all-wows-unpack-tool-unpack-game-client-resources/).
 
 2. Run the end-to-end update pipeline from the repo root:
