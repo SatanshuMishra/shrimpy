@@ -35,11 +35,14 @@ $RedisPassword = "shrimpy"
 # PID and log paths (process-based lifecycle; survives session boundaries)
 $GeneratedDir = Join-Path $ProjectRoot "generated"
 $PidFileBot = Join-Path $GeneratedDir "shrimpy-bot.pid"
-$PidFileWorker = Join-Path $GeneratedDir "shrimpy-worker.pid"
+$PidFileSupervisor = Join-Path $GeneratedDir "shrimpy-supervisor.pid"
 $LogFileBot = Join-Path $GeneratedDir "shrimpy-bot.log"
 $LogFileBotErr = Join-Path $GeneratedDir "shrimpy-bot.err"
-$LogFileWorker = Join-Path $GeneratedDir "shrimpy-worker.log"
-$LogFileWorkerErr = Join-Path $GeneratedDir "shrimpy-worker.err"
+$LogFileSupervisor = Join-Path $GeneratedDir "shrimpy-supervisor.log"
+$LogFileSupervisorErr = Join-Path $GeneratedDir "shrimpy-supervisor.err"
+
+# Worker count (1-4, default 1 or from WORKER_COUNT env)
+$WorkerCount = if ($env:WORKER_COUNT) { [int]$env:WORKER_COUNT } else { 3 }
 
 function Write-ColorOutput($ForegroundColor, $Message) {
     $fc = $host.UI.RawUI.ForegroundColor
@@ -102,8 +105,10 @@ function Ensure-StoppedBot {
     Stop-OrphanProcesses "run.py" "Bot"
 }
 
-function Ensure-StoppedWorker {
-    Stop-ProcessByPidFile $PidFileWorker "Worker"
+function Ensure-StoppedSupervisor {
+    Stop-ProcessByPidFile $PidFileSupervisor "Supervisor"
+    Stop-OrphanProcesses "worker_supervisor.py" "Supervisor"
+    # Also kill any orphan workers
     Stop-OrphanProcesses "worker.py" "Worker"
 }
 
@@ -138,7 +143,7 @@ function Start-Redis {
 function Stop-Services {
     Write-Output "[...] Stopping services..."
     Ensure-StoppedBot
-    Ensure-StoppedWorker
+    Ensure-StoppedSupervisor
 }
 
 function Start-Services {
@@ -146,7 +151,7 @@ function Start-Services {
 
     # Idempotent start: ensure no existing process, then start one.
     Ensure-StoppedBot
-    Ensure-StoppedWorker
+    Ensure-StoppedSupervisor
 
     if (-not (Start-Redis)) {
         Write-ColorOutput Red "[FAIL] Cannot start services without Redis"
@@ -174,12 +179,13 @@ function Start-Services {
         -RedirectStandardOutput $LogFileBot -RedirectStandardError $LogFileBotErr
     $botProcess.Id | Set-Content $PidFileBot -Force
 
-    # Start Worker
-    Write-Output "[...] Starting worker..."
-    $workerProcess = Start-Process -FilePath $pythonExe -ArgumentList "bot/worker.py", "-q", "single", "dual" -WorkingDirectory $ProjectRoot `
+    # Start Worker Supervisor (manages N workers with auto-respawn)
+    Write-Output "[...] Starting worker supervisor ($WorkerCount worker(s))..."
+    $supervisorArgs = @("bot/worker_supervisor.py", "-n", $WorkerCount)
+    $supervisorProcess = Start-Process -FilePath $pythonExe -ArgumentList $supervisorArgs -WorkingDirectory $ProjectRoot `
         -PassThru -NoNewWindow `
-        -RedirectStandardOutput $LogFileWorker -RedirectStandardError $LogFileWorkerErr
-    $workerProcess.Id | Set-Content $PidFileWorker -Force
+        -RedirectStandardOutput $LogFileSupervisor -RedirectStandardError $LogFileSupervisorErr
+    $supervisorProcess.Id | Set-Content $PidFileSupervisor -Force
 
     Start-Sleep 5
     Get-ServiceStatus
@@ -214,20 +220,20 @@ function Get-ServiceStatus {
         Write-ColorOutput Red "Bot:    STOPPED"
     }
 
-    # Worker
-    $workerRunning = $false
-    if (Test-Path $PidFileWorker) {
-        $pidVal = (Get-Content $PidFileWorker -Raw -ErrorAction SilentlyContinue).Trim()
+    # Supervisor (manages workers)
+    $supervisorRunning = $false
+    if (Test-Path $PidFileSupervisor) {
+        $pidVal = (Get-Content $PidFileSupervisor -Raw -ErrorAction SilentlyContinue).Trim()
         $proc = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
-        if ($proc -and (Test-IsOurProcess $pidVal "worker.py")) {
-            $workerRunning = $true
-            Write-ColorOutput Green "Worker: RUNNING (PID $pidVal)"
+        if ($proc -and (Test-IsOurProcess $pidVal "worker_supervisor.py")) {
+            $supervisorRunning = $true
+            Write-ColorOutput Green "Supervisor: RUNNING (PID $pidVal, $WorkerCount worker(s))"
         } else {
-            Remove-Item $PidFileWorker -Force -ErrorAction SilentlyContinue
+            Remove-Item $PidFileSupervisor -Force -ErrorAction SilentlyContinue
         }
     }
-    if (-not $workerRunning) {
-        Write-ColorOutput Red "Worker: STOPPED"
+    if (-not $supervisorRunning) {
+        Write-ColorOutput Red "Supervisor: STOPPED"
     }
 
     Write-Output ""
@@ -275,13 +281,13 @@ function Show-Help {
     Write-Output "Usage: .\scripts\dev.ps1 <action>"
     Write-Output ""
     Write-Output "Actions:"
-    Write-Output "  start        Start Redis, Bot, and Worker (idempotent: stops existing first)"
+    Write-Output "  start        Start Redis, Bot, and Worker Supervisor (idempotent: stops existing first)"
     Write-Output "  start-sync   Start with command tree sync (registers /renderbatch etc. with Discord)"
-    Write-Output "  stop         Stop Bot and Worker (idempotent; works across sessions)"
+    Write-Output "  stop         Stop Bot and Supervisor (idempotent; works across sessions)"
     Write-Output "  restart      Stop all, ensure Redis, flush queues, start fresh"
     Write-Output "  status       Show status of all services (PID-based)"
     Write-Output "  logs         Stream bot logs (generated/shrimpy-bot.err); set SHIMPY_DEBUG=1 for verbose"
-    Write-Output "  worker-logs  Stream worker logs (generated/shrimpy-worker.log)"
+    Write-Output "  worker-logs  Stream supervisor/worker logs (generated/shrimpy-supervisor.err)"
     Write-Output "  flush        Flush all Redis queues"
     Write-Output "  help         Show this help message"
     Write-Output ""
@@ -289,10 +295,14 @@ function Show-Help {
     Write-Output "reliably when run via powershell -File or from any terminal."
     Write-Output ""
     Write-Output "Environment Variables:"
-    Write-Output "  REDIS_PORT   Redis port (default: 6380)"
+    Write-Output "  REDIS_PORT    Redis port (default: 6380)"
+    Write-Output "  WORKER_COUNT  Number of parallel render workers (1-4, default: 3)"
+    Write-Output ""
+    Write-Output "The supervisor auto-respawns crashed workers with exponential backoff."
+    Write-Output "Failed jobs are retried up to 3 times by RQ before being marked as failed."
     Write-Output ""
     Write-Output "Examples:"
-    Write-Output "  .\scripts\dev.ps1 start       # Start everything"
+    Write-Output "  .\scripts\dev.ps1 start       # Start everything (3 workers by default)"
     Write-Output "  .\scripts\dev.ps1 restart     # Clean restart"
     Write-Output "  .\scripts\dev.ps1 logs        # Stream bot logs"
     Write-Output ""
@@ -331,7 +341,7 @@ switch ($Action) {
         Watch-Logs -LogFilePath $LogFileBotErr -Label "ShrimpyBot"
     }
     "worker-logs" {
-        Watch-Logs -LogFilePath $LogFileWorker -Label "ShrimpyWorker"
+        Watch-Logs -LogFilePath $LogFileSupervisorErr -Label "ShrimpySupervisor"
     }
     "flush" {
         Flush-Queue
