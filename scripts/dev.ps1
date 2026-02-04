@@ -280,7 +280,7 @@ function Show-Help {
     Write-Output "  stop         Stop Bot and Worker (idempotent; works across sessions)"
     Write-Output "  restart      Stop all, ensure Redis, flush queues, start fresh"
     Write-Output "  status       Show status of all services (PID-based)"
-    Write-Output "  logs         Stream bot logs (generated/shrimpy-bot.log)"
+    Write-Output "  logs         Stream bot logs (generated/shrimpy-bot.err); set SHIMPY_DEBUG=1 for verbose"
     Write-Output "  worker-logs  Stream worker logs (generated/shrimpy-worker.log)"
     Write-Output "  flush        Flush all Redis queues"
     Write-Output "  help         Show this help message"
@@ -327,7 +327,8 @@ switch ($Action) {
         Get-ServiceStatus
     }
     "logs" {
-        Watch-Logs -LogFilePath $LogFileBot -Label "ShrimpyBot"
+        # Bot logs go to stderr (StreamHandler); stdout is mostly empty
+        Watch-Logs -LogFilePath $LogFileBotErr -Label "ShrimpyBot"
     }
     "worker-logs" {
         Watch-Logs -LogFilePath $LogFileWorker -Label "ShrimpyWorker"
