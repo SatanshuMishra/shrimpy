@@ -467,7 +467,7 @@ def format_replay_summary_line(
     unix_ts: Optional[int] = None,
 ) -> str:
     """
-    One-line for include_summary: Discord dynamic timestamp <t:unix:t> so each viewer
+    One-line for summary: Discord dynamic timestamp <t:unix:t> so each viewer
     sees the time in their local timezone. When unix_ts is None we derive it from
     filename + tz_override (or UTC). Map uses _format_map_display.
     """
@@ -497,7 +497,7 @@ def format_replay_summary_line(
 
 
 def _format_summary_overall_stats(batch_battle_stats: Optional[list]) -> str:
-    """Build '**Overall Statistics**:\\nWin-Rate: 60%' block for include_summary. Only titles bold."""
+    """Build '**Overall Statistics**:\\nWin-Rate: 60%' block for summary. Only titles bold."""
     if not batch_battle_stats:
         return ""
     wins, total, rate = aggregate_win_rate(batch_battle_stats)
@@ -1451,7 +1451,7 @@ async def _poll_single_batch_job(
     total: int,
     results_list: list,
     lock: asyncio.Lock,
-    single_message: bool = False,
+    compact: bool = False,
     rendered_files: Optional[list] = None,
     batch_battle_stats: Optional[list] = None,
     batch_replay_timestamps: Optional[list] = None,
@@ -1535,7 +1535,7 @@ async def _poll_single_batch_job(
                             batch_replay_timestamps[job_index] = replay_ts
                         if rendered_files is not None:
                             rendered_files[job_index] = (out_name, data)
-                        if single_message:
+                        if compact:
                             # Coordinator will send combined; just mark done
                             results_list[job_index] = (filename, "Done", None)
                         else:
@@ -1676,7 +1676,7 @@ async def _recover_finished_batch_jobs(
     rendered_files: Optional[list],
     batch_battle_stats: Optional[list],
     batch_replay_timestamps: Optional[list],
-    single_message: bool,
+    compact: bool,
 ) -> None:
     """
     Industry-standard recovery loop: wait for and recover jobs that are still running or
@@ -1748,7 +1748,7 @@ async def _recover_finished_batch_jobs(
                 if batch_replay_timestamps is not None and i < len(batch_replay_timestamps):
                     batch_replay_timestamps[i] = replay_ts
 
-                if single_message:
+                if compact:
                     results_list[i] = (fn, "Done", None)
                 else:
                     if len(data) > DISCORD_MAX_FILE_BYTES:
@@ -1825,8 +1825,8 @@ async def _batch_coordinator(
     bytes_list: list,
     user_id: int,
     results_list: list,
-    single_message: bool,
-    include_summary: bool,
+    compact: bool,
+    summary: bool,
     interaction_token: Optional[str],
     application_id: Optional[str],
     files_message_id: int,
@@ -1839,8 +1839,8 @@ async def _batch_coordinator(
     Coordinator: spawn poll tasks, wait for ALL to complete, then send and cleanup.
     Cleanup (task_request, cooldown, temp dir) ALWAYS runs in finally so the bot
     stays usable even when delivery fails.
-    Also collects battle stats for win rate calculation when include_summary is True.
-    When include_summary and upload_timestamp are set, timezone is inferred so the
+    Also collects battle stats for win rate calculation when summary is True.
+    When summary and upload_timestamp are set, timezone is inferred so the
     uploader sees their local time and other viewers see the same moment in their TZ.
     """
     lock = asyncio.Lock()
@@ -1849,7 +1849,7 @@ async def _batch_coordinator(
     # Resolve timezone for summary display: user-set > UTC.
     summary_tz = None
     summary_tz_from_user_setting = False
-    if include_summary:
+    if summary:
         try:
             user = await db.User.get_or_create(id=user_id)
             user_tz = getattr(user, "replay_timezone", None)
@@ -1883,7 +1883,7 @@ async def _batch_coordinator(
                     total,
                     results_list,
                     lock,
-                    single_message,
+                    compact,
                     rendered_files,
                     batch_battle_stats,
                     batch_replay_timestamps,
@@ -1921,7 +1921,7 @@ async def _batch_coordinator(
             rendered_files,
             batch_battle_stats,
             batch_replay_timestamps,
-            single_message,
+            compact,
         )
 
         # Sync results_list from rendered_files (don't rely on expired RQ job results)
@@ -1949,7 +1949,7 @@ async def _batch_coordinator(
         fallback_reason: Optional[str] = None
         num_bucket_messages: Optional[int] = None
 
-        if single_message and entries_for_send:
+        if compact and entries_for_send:
             # Pre-flight: skip combined send if over Discord limits
             total_size = sum(len(d) for _, d in entries_for_send)
             max_file = max(len(d) for _, d in entries_for_send)
@@ -2014,7 +2014,7 @@ async def _batch_coordinator(
                     if first_parsed else "Renders"
                 )
                 any_bucket_failed = False
-                if include_summary and batch_replay_timestamps is not None:
+                if summary and batch_replay_timestamps is not None:
                     meta_count = sum(1 for x in batch_replay_timestamps if x is not None)
                     logger.info(
                         "Batch summary: metadata_timestamps=%s/%s (rest use filename+tz=%s)",
@@ -2022,7 +2022,7 @@ async def _batch_coordinator(
                         len(batch_replay_timestamps),
                         summary_tz or "UTC",
                     )
-                # For include_summary: continuous numbering across buckets (second message starts at 7 if first had 6)
+                # For summary: continuous numbering across buckets (second message starts at 7 if first had 6)
                 summary_start_by_bucket = []
                 if buckets:
                     acc = 0
@@ -2030,7 +2030,7 @@ async def _batch_coordinator(
                         summary_start_by_bucket.append(acc)
                         acc += len(b)
                 for bucket_idx, bucket in enumerate(buckets):
-                    if include_summary:
+                    if summary:
                         start_num = summary_start_by_bucket[bucket_idx]
                         # When user set timezone, use filename+tz only (ignore metadata ts).
                         # When user set timezone, use filename+tz so the moment is correct; else use metadata.
@@ -2092,7 +2092,7 @@ async def _batch_coordinator(
                     if st == "Done":
                         results_list[i] = (fn, "Done", sent_combined.jump_url)
 
-                if include_summary:
+                if summary:
                     if batch_replay_timestamps is not None:
                         meta_count = sum(1 for x in batch_replay_timestamps if x is not None)
                         logger.info(
@@ -2141,8 +2141,8 @@ async def _batch_coordinator(
                 line += f" — {link}"
             desc_lines.append(line)
         final_desc = "\n".join(desc_lines)
-        # Add win rate to final embed when include_summary is True
-        if include_summary and batch_battle_stats:
+        # Add win rate to final embed when summary is True
+        if summary and batch_battle_stats:
             win_rate_line = format_win_rate_line(batch_battle_stats)
             if win_rate_line:
                 final_desc += f"\n\n{win_rate_line}"
@@ -2196,8 +2196,8 @@ async def _batch_coordinator(
                 except Exception as e:
                     logger.warning("Could not notify user of failed replays: %s", e)
 
-        if include_summary and interaction_token and application_id:
-            if not single_message:
+        if summary and interaction_token and application_id:
+            if not compact:
                 await _send_ephemeral_followup(
                     application_id,
                     interaction_token,
@@ -2324,8 +2324,8 @@ class RenderCog(commands.Cog):
         anon='Anonymizes player names in the format "Player X", and defaults to off. Ignored when logs is off.',
         chat="Shows chat, and defaults to on. Ignored when logs is off.",
         team_tracers="Colors tracers by their relation to the replay creator, and defaults to off.",
-        single_message="Attach all renders in a single Discord message (up to 10 files). Defaults to off.",
-        include_summary="Include a numbered summary of all renders in the message text. Only applies when single_message is enabled.",
+        compact="Attach all renders in a single Discord message (up to 10 files). Defaults to off.",
+        summary="Include a numbered summary of all renders in the message text. Only applies when compact is enabled.",
     )
     async def render_batch(
         self,
@@ -2336,8 +2336,8 @@ class RenderCog(commands.Cog):
         anon: bool = False,
         chat: bool = True,
         team_tracers: bool = False,
-        single_message: bool = False,
-        include_summary: bool = False,
+        compact: bool = False,
+        summary: bool = False,
     ):
         await interaction.response.defer()
         embed = discord.Embed(
@@ -2358,8 +2358,8 @@ class RenderCog(commands.Cog):
             "anon": anon,
             "chat": chat,
             "team_tracers": team_tracers,
-            "single_message": single_message,
-            "include_summary": include_summary,
+            "compact": compact,
+            "summary": summary,
             "interaction_token": interaction.token,
             "application_id": str(interaction.application_id),
         }
@@ -2463,8 +2463,8 @@ class RenderCog(commands.Cog):
             job_ids.append(job.id)
 
         results_list = [(fn, "Queued", None) for fn in filenames]
-        single_message = payload.get("single_message", False)
-        include_summary = payload.get("include_summary", False)
+        compact = payload.get("compact", False)
+        summary = payload.get("summary", False)
         rendered_files = [None] * len(replays)
         batch_battle_stats: list[Optional[BattleStats]] = [None] * len(replays)
         batch_replay_timestamps: list[Optional[int]] = [None] * len(replays)
@@ -2496,8 +2496,8 @@ class RenderCog(commands.Cog):
                 bytes_list,
                 payload["user_id"],
                 results_list,
-                single_message,
-                include_summary,
+                compact,
+                summary,
                 interaction_token,
                 application_id,
                 message.id,
