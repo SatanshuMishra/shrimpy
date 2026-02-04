@@ -17,7 +17,10 @@ from bot.utils.errors import ArenaMismatchError, RenderError, VersionNotFoundErr
 
 # SECURITY: Maximum video output size (25 MB) to prevent Redis/memory exhaustion
 MAX_VIDEO_OUTPUT_BYTES = 25 * 1024 * 1024
-from bot.utils.replay_stats import extract_battle_stats_from_replay_info
+from bot.utils.replay_stats import (
+    extract_battle_stats_from_replay_info,
+    extract_replay_timestamp_from_replay_info,
+)
 from config import cfg
 
 _url = f"redis://:{cfg.redis.password}@{cfg.redis.host}:{cfg.redis.port}/"
@@ -148,8 +151,9 @@ def render_single(
 
             chat += f"[{battle_time // 60:02}:{battle_time % 60:02}] {clan_tag}{name}: {message.message}\n"
 
-    # Extract battle statistics for win/loss tracking (modular, reusable)
+    # Extract battle statistics + authoritative replay timestamp for batch summaries
     battle_stats = extract_battle_stats_from_replay_info(replay_info)
+    replay_ts = extract_replay_timestamp_from_replay_info(replay_info)
 
     if requester_id:
         _redis.set(f"cooldown_{requester_id}", "", ex=cooldown)
@@ -160,6 +164,7 @@ def render_single(
         json.dumps(render.get_player_build()),
         chat,
         battle_stats,  # 6th element: BattleStats or None
+        replay_ts,  # 7th element: authoritative Unix timestamp (seconds) or None
     )
 
 

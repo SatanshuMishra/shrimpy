@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,104 @@ def extract_battle_stats_from_replay_info(replay_info: dict) -> Optional[BattleS
     except Exception as e:
         logger.warning("Failed to extract battle stats: %s", e)
         return None
+
+
+def _parse_replay_timestamp_value(value: object) -> Optional[int]:
+    """
+    Best-effort parsing of a replay timestamp value into Unix seconds (UTC).
+    Supports ints (seconds or milliseconds), floats, datetimes, and common string formats.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if isinstance(value, (int, float)):
+        # Heuristic: values > 1e12 are milliseconds
+        if value > 1_000_000_000_000:
+            return int(value / 1000)
+        if value > 1_000_000_000:
+            return int(value)
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return _parse_replay_timestamp_value(int(raw))
+        # ISO 8601, with optional Z
+        try:
+            iso = raw.replace("Z", "+00:00")
+            return int(datetime.fromisoformat(iso).timestamp())
+        except ValueError:
+            pass
+        # Common replay datetime formats
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y.%m.%d %H:%M:%S",
+            "%d.%m.%Y %H:%M:%S",
+        ):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp())
+            except ValueError:
+                continue
+    return None
+
+
+def extract_replay_timestamp_from_replay_info(replay_info: dict) -> Optional[int]:
+    """
+    Extract the authoritative replay timestamp (Unix seconds) from ReplayParser.get_info().
+    Uses multiple known fields across 'open' and 'hidden' sections to avoid filename parsing.
+    Returns None if no authoritative timestamp is found.
+    """
+    if not replay_info or not isinstance(replay_info, dict):
+        return None
+    # Check 'open' metadata first (often contains dateTime / timestamp)
+    open_info = replay_info.get("open")
+    if isinstance(open_info, dict):
+        for key in (
+            "dateTime",
+            "date_time",
+            "datetime",
+            "timestamp",
+            "startTime",
+            "start_time",
+            "battleStartTime",
+            "battle_start_time",
+        ):
+            if key in open_info:
+                ts = _parse_replay_timestamp_value(open_info.get(key))
+                if ts is not None:
+                    logger.info("Replay timestamp from metadata (open.%s): unix_ts=%s", key, ts)
+                    return ts
+    # Check 'hidden' replay_data attributes
+    hidden = replay_info.get("hidden")
+    replay_data = hidden.get("replay_data") if isinstance(hidden, dict) else None
+    if replay_data is not None:
+        for attr in (
+            "dateTime",
+            "date_time",
+            "datetime",
+            "timestamp",
+            "startTime",
+            "start_time",
+            "battleStartTime",
+            "battle_start_time",
+            "arena_create_time",
+            "game_start_time",
+        ):
+            try:
+                ts = _parse_replay_timestamp_value(getattr(replay_data, attr, None))
+                if ts is not None:
+                    logger.info("Replay timestamp from metadata (hidden.%s): unix_ts=%s", attr, ts)
+                    return ts
+            except Exception:
+                continue
+    logger.debug("No replay timestamp found in metadata")
+    return None
 
 
 def extract_battle_stats(replay_bytes: bytes) -> Optional[BattleStats]:
