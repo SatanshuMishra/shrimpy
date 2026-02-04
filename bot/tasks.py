@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import logging
 import os
 import tempfile
 import time
@@ -26,15 +27,25 @@ from config import cfg
 _url = f"redis://:{cfg.redis.password}@{cfg.redis.host}:{cfg.redis.port}/"
 _redis = redis.from_url(_url)
 
+logger = logging.getLogger(__name__)
+
 
 @contextlib.contextmanager
 def temp():
-    tmp = tempfile.NamedTemporaryFile("w+b", suffix=".mp4", delete=False)
+    """
+    Yield a path to a temporary .mp4 file that no process has open.
+    On Windows, a file cannot be opened again while our handle is open (WinError 32).
+    So we create the file, close it immediately, yield the path, then read and remove.
+    """
+    fd, path = tempfile.mkstemp(suffix=".mp4")
     try:
-        yield tmp
+        os.close(fd)
+        yield path
     finally:
-        tmp.close()
-        os.remove(tmp.name)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 @contextlib.contextmanager
@@ -90,6 +101,13 @@ def render_single(
     team_tracers: bool,
 ):
     job: Job = rq.get_current_job()
+    worker_id = os.environ.get("WORKER_ID", "?")
+    logger.info(
+        "[RENDER] job_id=%s worker_id=%s started: payload=%s bytes",
+        job.id,
+        worker_id,
+        len(data),
+    )
 
     with measure_time() as t:
         job.meta["status"] = "reading"
@@ -100,27 +118,44 @@ def render_single(
                 replay_info = ReplayParser(fp, strict=True).get_info()
                 replay_data: ReplayData = replay_info["hidden"]["replay_data"]
         except (ModuleNotFoundError, RuntimeError):
+            logger.info(
+                "[RENDER] job_id=%s worker_id=%s FAILED: VersionNotFoundError (parse)",
+                job.id,
+                worker_id,
+            )
             return VersionNotFoundError()
 
         try:
             job.meta["status"] = "rendering"
             job.save_meta()
 
-            with temp() as tmp:
+            with temp() as tmp_path:
                 render = Renderer(
                     replay_data, logs, anon, enable_chat, team_tracers, use_tqdm=False
                 )
-                render.start(tmp.name, fps, quality, progress_callback(job))
-                tmp.seek(0)
-                video_data = tmp.read()
+                render.start(tmp_path, fps, quality, progress_callback(job))
+                with open(tmp_path, "rb") as f:
+                    video_data = f.read()
 
                 # SECURITY: Enforce video output size limit to prevent Redis/memory exhaustion
                 if len(video_data) > MAX_VIDEO_OUTPUT_BYTES:
-                    return RenderError(
+                    msg = (
                         f"Rendered video too large ({len(video_data) / 1024 / 1024:.1f} MB). "
                         f"Try reducing quality or FPS."
                     )
+                    logger.info(
+                        "[RENDER] job_id=%s worker_id=%s FAILED: RenderError (too large) %s",
+                        job.id,
+                        worker_id,
+                        msg,
+                    )
+                    return RenderError(msg)
         except ModuleNotFoundError:
+            logger.info(
+                "[RENDER] job_id=%s worker_id=%s FAILED: VersionNotFoundError (render)",
+                job.id,
+                worker_id,
+            )
             return VersionNotFoundError()
 
     time_taken = time.strftime("%M:%S", time.gmtime(t()))
@@ -157,6 +192,13 @@ def render_single(
 
     if requester_id:
         _redis.set(f"cooldown_{requester_id}", "", ex=cooldown)
+    logger.info(
+        "[RENDER] job_id=%s worker_id=%s finished: success arena=%s took=%s",
+        job.id,
+        worker_id,
+        file_name,
+        time_taken,
+    )
     return (
         video_data,
         f"render_{file_name}",
@@ -201,7 +243,7 @@ def render_dual(
             job.meta["status"] = "rendering"
             job.save_meta()
 
-            with temp() as tmp:
+            with temp() as tmp_path:
                 RenderDual(
                     g_replay_data,
                     r_replay_data,
@@ -209,9 +251,9 @@ def render_dual(
                     red_name,
                     team_tracers,
                     use_tqdm=False,
-                ).start(tmp.name, fps, quality, progress_callback(job))
-                tmp.seek(0)
-                video_data = tmp.read()
+                ).start(tmp_path, fps, quality, progress_callback(job))
+                with open(tmp_path, "rb") as f:
+                    video_data = f.read()
 
                 # SECURITY: Enforce video output size limit to prevent Redis/memory exhaustion
                 if len(video_data) > MAX_VIDEO_OUTPUT_BYTES:
