@@ -3,7 +3,7 @@ import os
 import cachetools
 import cachetools.keys
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import Boolean, Column, Float, Integer, JSON, String
+from sqlalchemy import Boolean, Column, Float, Integer, JSON, String, text
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -79,6 +79,7 @@ class User(Base, CachedMixin):
     wg_ac = Column(String, default=None)
     background = Column(String, default=None)
     locale = Column(String, default=None)
+    replay_timezone = Column(String, default=None)
     is_blacklisted = Column(Boolean, default=False)
     is_premium = Column(Boolean, default=False)
 
@@ -103,3 +104,20 @@ if __name__ == "__main__":
     import asyncio
 
     asyncio.run(create_tables())
+
+
+async def ensure_schema() -> None:
+    """
+    Lightweight schema migration for new columns in SQLite.
+    Adds users.replay_timezone if missing.
+    """
+    async with engine.begin() as conn:
+        def _ensure(sync_conn):
+            rows = sync_conn.execute(text("PRAGMA table_info(users)")).fetchall()
+            cols = {row[1] for row in rows}
+            if "replay_timezone" not in cols:
+                sync_conn.execute(
+                    text("ALTER TABLE users ADD COLUMN replay_timezone VARCHAR")
+                )
+
+        await conn.run_sync(_ensure)

@@ -1,5 +1,7 @@
 from typing import Dict, List, Optional
 import json
+import zoneinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from discord.ext import commands
 from discord import app_commands
@@ -69,6 +71,42 @@ class SettingsCog(commands.Cog):
 
         await interaction.response.send_message(
             f"Language set to `{wows_locale}`.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="settimezone",
+        description="Sets your local timezone for replay timestamps.",
+        extras={"category": "general"},
+    )
+    @app_commands.describe(
+        timezone="IANA timezone (e.g. America/New_York, Pacific/Honolulu)"
+    )
+    async def set_user_timezone(self, interaction: discord.Interaction, timezone: str):
+        try:
+            ZoneInfo(timezone)
+        except ZoneInfoNotFoundError:
+            if not zoneinfo.available_timezones():
+                await interaction.response.send_message(
+                    "Timezone database not available. Install `tzdata` and restart the bot.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                "Invalid timezone. Use an IANA name like `America/New_York` or `Pacific/Honolulu`.",
+                ephemeral=True,
+            )
+            return
+
+        async with db.async_session() as session:
+            user = (
+                await session.execute(select(db.User).filter_by(id=interaction.user.id))
+            ).scalar_one()
+            user.replay_timezone = timezone
+            await session.commit()
+        db.User.invalidate(id=interaction.user.id)
+
+        await interaction.response.send_message(
+            f"Timezone set to `{timezone}`.", ephemeral=True
         )
 
     @app_commands.command(
