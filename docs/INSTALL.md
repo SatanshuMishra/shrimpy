@@ -70,6 +70,7 @@ Edit `secrets.ini` and fill in (at least for `[testing]`):
 - `redis_host` – usually `localhost`
 - `wg_application_id` – Wargaming API application ID (for stats, etc.)
 - `twitter_bearer_token` – optional; only if you use the cat extension
+- `render_replay_timezone` – optional; your local IANA timezone (e.g. `America/New_York`) so batch summary times show in your timezone (default `UTC` otherwise)
 
 Use the `[production]` section when running in production.
 
