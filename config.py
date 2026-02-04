@@ -58,12 +58,36 @@ class ShrimpyConfig:
 
     render = environ.group(Render)
 
+    @environ.config(prefix="WORKER")
+    class Worker:
+        # Number of parallel render workers (min 1, max 4). More workers = faster batch processing.
+        # Each worker processes one job at a time; N workers = N parallel renders.
+        count = environ.var(1, converter=int)
+
+    worker = environ.group(Worker)
+
 
 def _parse_owner_ids(value: str):
     return {int(x.strip()) for x in value.split(",") if x.strip()} if value else None
 
 
 def _build_environ():
+    # Worker count: min 1, max 4 (clamped)
+    raw_worker_count_str = os.environ.get("WORKER_COUNT", "")
+    if not raw_worker_count_str:
+        try:
+            secret_val = ini_secrets.secret(name="worker_count", default=None)
+            if secret_val and isinstance(secret_val, str):
+                raw_worker_count_str = secret_val
+            else:
+                raw_worker_count_str = "1"
+        except Exception:
+            raw_worker_count_str = "1"
+    try:
+        raw_worker_count = int(raw_worker_count_str)
+    except (ValueError, TypeError):
+        raw_worker_count = 1
+    worker_count = max(1, min(4, raw_worker_count))
     env = {
         "CREATED": int(os.environ.get("CREATED", 1663989263)),
         "DISCORD_OWNER_IDS": _parse_owner_ids(os.environ.get("DISCORD_OWNER_IDS", ""))
@@ -75,6 +99,7 @@ def _build_environ():
         "RENDER_REPLAY_TIMEZONE": os.environ.get("RENDER_REPLAY_TIMEZONE")
         or ini_secrets.secret(name="render_replay_timezone", default="UTC")
         or "UTC",
+        "WORKER_COUNT": worker_count,
     }
     if "REDIS_PASSWORD" in os.environ:
         env["REDIS_PASSWORD"] = os.environ["REDIS_PASSWORD"]
