@@ -9,8 +9,9 @@ import shutil
 import ssl
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+import zoneinfo
 from zoneinfo import ZoneInfo
 from typing import Awaitable, Callable, Optional, TypeVar
 
@@ -38,7 +39,7 @@ from discord.ext import commands
 
 from bot import tasks
 from bot.shrimpy import Shrimpy
-from bot.utils import errors, functions
+from bot.utils import db, errors, functions
 from bot.utils.replay_stats import BattleStats, aggregate_win_rate, format_win_rate_line
 from config import cfg
 
@@ -292,6 +293,8 @@ def _parse_replay_filename(filename: str) -> Optional[dict]:
     try:
         date_formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
         time_formatted = f"{time_str[:2]}:{time_str[2:4]}"
+        # Full time with seconds for Discord dynamic timestamp (short-time only).
+        time_full = f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
     except (IndexError, TypeError):
         return None
     # ShipIndex: first hyphen separates code from ship name; ship name uses hyphens for spaces
@@ -307,6 +310,7 @@ def _parse_replay_filename(filename: str) -> Optional[dict]:
     return {
         "date": date_formatted,
         "time": time_formatted,
+        "time_full": time_full,
         "ship_name": ship_name,
         "map_name": map_name,
     }
@@ -339,34 +343,157 @@ def format_replay_display(filename: str) -> str:
 
 def _replay_datetime_to_unix(date_str: str, time_str: str, tz_name: str) -> Optional[int]:
     """
-    Interpret date_str (YYYY-MM-DD) and time_str (HH:MM) in the given IANA timezone,
-    return Unix timestamp (seconds since epoch, UTC) for Discord dynamic timestamps.
-    Returns None if parsing or timezone fails.
+    Interpret date_str (YYYY-MM-DD) and time_str (HH:MM:SS or HH:MM) in the given IANA timezone,
+    return Unix timestamp (seconds since epoch, UTC).
+    Uses full datetime from game (including seconds). Falls back to UTC if tz_name invalid.
+    Returns None only if date/time parsing fails.
+    """
+    dt_naive = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt_naive = datetime.strptime(f"{date_str} {time_str}", fmt)
+            break
+        except (ValueError, TypeError):
+            continue
+    if dt_naive is None:
+        return None
+    for tz_try in (tz_name or "UTC", "UTC"):
+        try:
+            tz = ZoneInfo(tz_try)
+            return int(dt_naive.replace(tzinfo=tz).timestamp())
+        except Exception:
+            continue
+    # Last resort: interpret as UTC so we always return a timestamp (Discord short-time).
+    return int(dt_naive.replace(tzinfo=timezone.utc).timestamp())
+
+
+def _format_unix_time(unix_ts: int, tz_name: str) -> Optional[str]:
+    """
+    Convert a Unix timestamp to a short time string in tz_name.
+    Returns None only if conversion fails.
     """
     try:
-        dt_naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         tz = ZoneInfo(tz_name)
-        dt_local = dt_naive.replace(tzinfo=tz)
-        return int(dt_local.timestamp())
-    except (ValueError, TypeError, Exception):
+        tz_label = tz_name
+    except Exception:
+        tz = timezone.utc
+        tz_label = "UTC"
+    try:
+        dt = datetime.fromtimestamp(unix_ts, tz=tz)
+    except (OSError, OverflowError, ValueError):
         return None
+    abbr = dt.strftime("%Z") or tz_label
+    return f"{dt:%H:%M} {abbr}".strip()
 
 
-def format_replay_summary_line(filename: str) -> str:
+def _format_unix_datetime(unix_ts: int, tz_name: str) -> Optional[str]:
     """
-    One-line for include_summary: Discord dynamic time + map only (no date, no ship).
-    Time is shown in the viewer's timezone via <t:unix:t>. Map uses _format_map_display.
-    Falls back to format_replay_display if parse or timestamp fails.
+    Convert a Unix timestamp to a date+time string in tz_name.
+    Returns None only if conversion fails.
+    """
+    try:
+        tz = ZoneInfo(tz_name)
+        tz_label = tz_name
+    except Exception:
+        tz = timezone.utc
+        tz_label = "UTC"
+    try:
+        dt = datetime.fromtimestamp(unix_ts, tz=tz)
+    except (OSError, OverflowError, ValueError):
+        return None
+    abbr = dt.strftime("%Z") or tz_label
+    return f"{dt:%Y-%m-%d} {dt:%H:%M} {abbr}".strip()
+
+
+def _infer_timezone_from_upload(filename: str, upload_timestamp: float) -> str:
+    """
+    Infer the uploader's timezone from the first replay filename and when they uploaded.
+    The replay time in the filename is in the uploader's local time; the message was sent
+    at upload_timestamp (UTC). The replay moment must be *before* the upload (you can't
+    upload before the game happened). So we only consider TZ where replay_ts <= upload_ts,
+    and pick the one where replay is closest to but not after upload — i.e. smallest
+    (upload_ts - replay_ts). That way we get "when they played" in their TZ; Discord
+    then shows that moment in each viewer's local time.
+    """
+    parsed = _parse_replay_filename(filename)
+    if not parsed:
+        return "UTC"
+    time_for_ts = parsed.get("time_full") or parsed["time"]
+    dt_naive = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            dt_naive = datetime.strptime(
+                f"{parsed['date']} {time_for_ts}", fmt
+            )
+            break
+        except (ValueError, TypeError):
+            continue
+    if dt_naive is None:
+        return "UTC"
+    best_tz = "UTC"
+    best_gap = float("inf")  # upload_ts - replay_ts (only when replay_ts <= upload_ts)
+    # Fallback when replay is "same local day" but already next day in UTC (e.g. Hawaii evening).
+    best_future_gap = float("inf")  # replay_ts - upload_ts when 0 < replay_ts - upload_ts <= 14h
+    best_future_tz = "UTC"
+    try:
+        for tz_name in zoneinfo.available_timezones():
+            try:
+                tz = ZoneInfo(tz_name)
+                ts = int(dt_naive.replace(tzinfo=tz).timestamp())
+                if ts <= upload_timestamp:
+                    gap = upload_timestamp - ts
+                    if gap < best_gap:
+                        best_gap = gap
+                        best_tz = tz_name
+                elif 0 < ts - upload_timestamp <= 14 * 3600:
+                    fgap = ts - upload_timestamp
+                    if fgap < best_future_gap:
+                        best_future_gap = fgap
+                        best_future_tz = tz_name
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if best_gap != float("inf"):
+        return best_tz
+    if best_future_gap != float("inf"):
+        return best_future_tz
+    return best_tz
+
+
+def format_replay_summary_line(
+    filename: str,
+    tz_override: Optional[str] = None,
+    unix_ts: Optional[int] = None,
+) -> str:
+    """
+    One-line for include_summary: Discord dynamic timestamp <t:unix:t> so each viewer
+    sees the time in their local timezone. When unix_ts is None we derive it from
+    filename + tz_override (or UTC). Map uses _format_map_display.
     """
     parsed = _parse_replay_filename(filename)
     if not parsed:
         return format_replay_display(filename)
-    tz_name = cfg.render.replay_timezone or "UTC"
-    unix_ts = _replay_datetime_to_unix(parsed["date"], parsed["time"], tz_name)
+    tz_name = tz_override or "UTC"
+    if unix_ts is None:
+        time_for_ts = parsed.get("time_full") or parsed["time"]
+        unix_ts = _replay_datetime_to_unix(parsed["date"], time_for_ts, tz_name)
+        logger.debug(
+            "Summary line from filename: tz=%s unix_ts=%s file=%s",
+            tz_name,
+            unix_ts,
+            filename[:50],
+        )
+    else:
+        logger.debug(
+            "Summary line from metadata: unix_ts=%s file=%s",
+            unix_ts,
+            filename[:50],
+        )
     map_display = _format_map_display(parsed["map_name"])
     if unix_ts is not None:
         return f"<t:{unix_ts}:t> · {map_display}"
-    return f"{parsed['time']} · {map_display}"
+    return format_replay_display(filename)
 
 
 def _format_summary_overall_stats(batch_battle_stats: Optional[list]) -> str:
@@ -540,7 +667,24 @@ class Render:
         self, input_name: str, filename: Optional[str] = None
     ) -> None:
         initial_position = await self.async_job_position()
-        embed = RenderWaitingEmbed(input_name, initial_position, filename=filename)
+        summary_tz = "UTC"
+        try:
+            user = await db.User.get_or_create(id=self._interaction.user.id)
+            user_tz = getattr(user, "replay_timezone", None)
+            if user_tz:
+                summary_tz = user_tz
+        except Exception as e:
+            logger.debug(
+                "Could not load user timezone for %s: %s",
+                self._interaction.user.id,
+                e,
+            )
+        embed = RenderWaitingEmbed(
+            input_name,
+            initial_position,
+            filename=filename,
+            summary_tz=summary_tz,
+        )
         message = await self.message(embed=embed)
         last_position: Optional[int] = None
         last_progress: Optional[float] = None
@@ -567,7 +711,10 @@ class Render:
                         continue
 
                     embed = RenderWaitingEmbed(
-                        input_name, position, filename=filename
+                        input_name,
+                        position,
+                        filename=filename,
+                        summary_tz=summary_tz,
                     )
                     message = await message.edit(embed=embed)
                     last_position = position
@@ -584,7 +731,11 @@ class Render:
                         continue
 
                     embed = RenderStartedEmbed(
-                        input_name, progress, task_status=task_status, filename=filename
+                        input_name,
+                        progress,
+                        task_status=task_status,
+                        filename=filename,
+                        summary_tz=summary_tz,
                     )
                     message = await message.edit(embed=embed)
                     last_progress = progress
@@ -596,6 +747,15 @@ class Render:
                     if isinstance(self._job.result, tuple):
                         # Unpack 5 or 6 elements (6th is battle_stats, unused in single render)
                         data, result_fn, time_taken, builds_str, chat = self._job.result[:5]
+                        replay_ts = (
+                            self._job.result[6] if len(self._job.result) >= 7 else None
+                        )
+                        # When user set timezone, use filename+tz so the moment is correct.
+                        summary_unix_ts = (
+                            None
+                            if (summary_tz and summary_tz != "UTC")
+                            else replay_ts
+                        )
                         # battle_stats = self._job.result[5] if len(self._job.result) >= 6 else None
 
                         try:
@@ -618,18 +778,23 @@ class Render:
                                 sent_message,
                                 time_taken,
                                 filename=filename,  # original replay filename for summary
+                                summary_tz=summary_tz,
+                                unix_ts=summary_unix_ts,
                             )
                         except discord.HTTPException:
                             embed = RenderFailureEmbed(
                                 input_name,
                                 "Rendered file too large (>8 MB). Consider reducing quality.",
                                 filename=filename,
+                                summary_tz=summary_tz,
+                                unix_ts=summary_unix_ts,
                             )
                     elif isinstance(self._job.result, errors.RenderError):
                         embed = RenderFailureEmbed(
                             input_name,
                             self._job.result.message,
                             filename=filename,
+                            summary_tz=summary_tz,
                         )
                     else:
                         logger.error(f"Unhandled job result {self._job.result}")
@@ -637,6 +802,7 @@ class Render:
                             input_name,
                             "An unhandled error occurred.",
                             filename=filename,
+                            summary_tz=summary_tz,
                         )
 
                     await message.edit(embed=embed)
@@ -647,7 +813,10 @@ class Render:
                     if timeout:
                         logger.warning("Render job timed out")
                         embed = RenderFailureEmbed(
-                            input_name, "Job timed out.", filename=filename
+                            input_name,
+                            "Job timed out.",
+                            filename=filename,
+                            summary_tz=summary_tz,
                         )
                     else:
                         # fetch again to update exc_info (in executor)
@@ -664,7 +833,10 @@ class Render:
                             err_message = "An unhandled error occurred."
 
                         embed = RenderFailureEmbed(
-                            input_name, err_message, filename=filename
+                            input_name,
+                            err_message,
+                            filename=filename,
+                            summary_tz=summary_tz,
                         )
                         await self._reupload(task_status, job.exc_info)
 
@@ -679,7 +851,10 @@ class Render:
 
                     logger.warning(f"Unknown job status {status}")
                     embed = RenderFailureEmbed(
-                        input_name, "Render job expired.", filename=filename
+                        input_name,
+                        "Render job expired.",
+                        filename=filename,
+                        summary_tz=summary_tz,
                     )
                     await message.edit(embed=embed)
                     break
@@ -921,14 +1096,23 @@ class RenderWT(Render):
         self._bot.loop.create_task(self.poll_result(f"{name_a} vs. {name_b}"))
 
 
-def _format_render_summary(filename: Optional[str]) -> Optional[str]:
-    """Build '**Date Time:** ... from parsed filename, or None. Labels bolded."""
+def _format_render_summary(
+    filename: Optional[str],
+    tz_override: Optional[str] = None,
+    unix_ts: Optional[int] = None,
+) -> Optional[str]:
+    """Build '**Date Time:** <t:unix:R>' summary so Discord shows time in viewer's local TZ."""
     parsed = _parse_replay_filename(filename) if filename else None
     if not parsed:
         return None
+    tz_name = tz_override or "UTC"
+    if unix_ts is None:
+        time_for_ts = parsed.get("time_full") or parsed["time"]
+        unix_ts = _replay_datetime_to_unix(parsed["date"], time_for_ts, tz_name)
+    date_time = f"<t:{unix_ts}:R>" if unix_ts is not None else f"{parsed['date']} {parsed['time']}"
     map_display = _format_map_display(parsed["map_name"])
     return (
-        f"**Date Time:** {parsed['date']} {parsed['time']}\n"
+        f"**Date Time:** {date_time}\n"
         f"**Ship:** {parsed['ship_name']}\n"
         f"**Map:** {map_display}"
     )
@@ -979,11 +1163,13 @@ class RenderEmbed(discord.Embed):
         title: str,
         input_name: str,
         filename: Optional[str] = None,
+        summary_tz: Optional[str] = None,
+        unix_ts: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(title=title, color=color)
 
-        summary = _format_render_summary(filename)
+        summary = _format_render_summary(filename, summary_tz, unix_ts)
         if summary:
             self.add_field(name="Render Summary", value=summary, inline=False)
         else:
@@ -1015,13 +1201,20 @@ class RenderWaitingEmbed(RenderEmbed):
     COLOR = 0x097DE3  # starting left bar: #097de3
 
     def __init__(
-        self, input_name: str, position: int, filename: Optional[str] = None
+        self,
+        input_name: str,
+        position: int,
+        filename: Optional[str] = None,
+        summary_tz: Optional[str] = None,
+        unix_ts: Optional[int] = None,
     ):
         super().__init__(
             self.COLOR,
             RenderEmbed.TITLE_STARTING,
             input_name,
             filename=filename,
+            summary_tz=summary_tz,
+            unix_ts=unix_ts,
             position=position,
         )
 
@@ -1035,12 +1228,16 @@ class RenderStartedEmbed(RenderEmbed):
         progress: float,
         task_status: Optional[str] = None,
         filename: Optional[str] = None,
+        summary_tz: Optional[str] = None,
+        unix_ts: Optional[int] = None,
     ):
         super().__init__(
             self.COLOR,
             RenderEmbed.TITLE_PROCESSING,
             input_name,
             filename=filename,
+            summary_tz=summary_tz,
+            unix_ts=unix_ts,
             status=task_status.title() if task_status else "Started",
             progress=progress,
         )
@@ -1056,6 +1253,8 @@ class RenderSuccessEmbed(RenderEmbed):
         sent_message: discord.Message,
         time_taken: str,
         filename: Optional[str] = None,
+        summary_tz: Optional[str] = None,
+        unix_ts: Optional[int] = None,
     ):
         sent_attachment = sent_message.attachments[0]
         result_msg = self.TEMPLATE.format(
@@ -1067,6 +1266,8 @@ class RenderSuccessEmbed(RenderEmbed):
             RenderEmbed.TITLE_SUMMARY,
             input_name,
             filename=filename,
+            summary_tz=summary_tz,
+            unix_ts=unix_ts,
             result=result_msg,
             time_taken=time_taken,
         )
@@ -1076,13 +1277,20 @@ class RenderFailureEmbed(RenderEmbed):
     COLOR = 0x32A885  # complete (error) left bar: #32a885
 
     def __init__(
-        self, input_name: str, err_message, filename: Optional[str] = None
+        self,
+        input_name: str,
+        err_message,
+        filename: Optional[str] = None,
+        summary_tz: Optional[str] = None,
+        unix_ts: Optional[int] = None,
     ):
         super().__init__(
             self.COLOR,
             RenderEmbed.TITLE_SUMMARY,
             input_name,
             filename=filename,
+            summary_tz=summary_tz,
+            unix_ts=unix_ts,
             status="Error",
             result=err_message,
         )
@@ -1246,6 +1454,7 @@ async def _poll_single_batch_job(
     single_message: bool = False,
     rendered_files: Optional[list] = None,
     batch_battle_stats: Optional[list] = None,
+    batch_replay_timestamps: Optional[list] = None,
 ) -> None:
     """
     Poll ONE batch job until it finishes/fails.
@@ -1316,11 +1525,14 @@ async def _poll_single_batch_job(
             async with lock:
                 if status == "finished" and job.result:
                     if isinstance(job.result, tuple):
-                        # Unpack 5 or 6 elements (6th is battle_stats)
+                        # Unpack 5+ elements (6th is battle_stats, 7th is replay timestamp)
                         data, out_name, time_taken, builds_str, chat = job.result[:5]
                         battle_stats = job.result[5] if len(job.result) >= 6 else None
+                        replay_ts = job.result[6] if len(job.result) >= 7 else None
                         if batch_battle_stats is not None:
                             batch_battle_stats[job_index] = battle_stats
+                        if batch_replay_timestamps is not None:
+                            batch_replay_timestamps[job_index] = replay_ts
                         if rendered_files is not None:
                             rendered_files[job_index] = (out_name, data)
                         if single_message:
@@ -1463,6 +1675,7 @@ async def _recover_finished_batch_jobs(
     results_list: list,
     rendered_files: Optional[list],
     batch_battle_stats: Optional[list],
+    batch_replay_timestamps: Optional[list],
     single_message: bool,
 ) -> None:
     """
@@ -1526,11 +1739,14 @@ async def _recover_finished_batch_jobs(
                 # Job completed! Recover the result.
                 data, out_name, time_taken, builds_str, chat = job.result[:5]
                 battle_stats = job.result[5] if len(job.result) >= 6 else None
+                replay_ts = job.result[6] if len(job.result) >= 7 else None
 
                 if rendered_files is not None and i < len(rendered_files):
                     rendered_files[i] = (out_name, data)
                 if batch_battle_stats is not None and i < len(batch_battle_stats):
                     batch_battle_stats[i] = battle_stats
+                if batch_replay_timestamps is not None and i < len(batch_replay_timestamps):
+                    batch_replay_timestamps[i] = replay_ts
 
                 if single_message:
                     results_list[i] = (fn, "Done", None)
@@ -1616,16 +1832,40 @@ async def _batch_coordinator(
     files_message_id: int,
     rendered_files: Optional[list],
     batch_battle_stats: Optional[list] = None,
+    batch_replay_timestamps: Optional[list] = None,
+    upload_timestamp: Optional[float] = None,
 ) -> None:
     """
     Coordinator: spawn poll tasks, wait for ALL to complete, then send and cleanup.
     Cleanup (task_request, cooldown, temp dir) ALWAYS runs in finally so the bot
     stays usable even when delivery fails.
     Also collects battle stats for win rate calculation when include_summary is True.
+    When include_summary and upload_timestamp are set, timezone is inferred so the
+    uploader sees their local time and other viewers see the same moment in their TZ.
     """
     lock = asyncio.Lock()
     total = len(job_ids)
     batch_temp_dir: Optional[Path] = None
+    # Resolve timezone for summary display: user-set > UTC.
+    summary_tz = None
+    summary_tz_from_user_setting = False
+    if include_summary:
+        try:
+            user = await db.User.get_or_create(id=user_id)
+            user_tz = getattr(user, "replay_timezone", None)
+            if user_tz:
+                summary_tz = user_tz
+                summary_tz_from_user_setting = True
+        except Exception as e:
+            logger.debug("Could not load user timezone for %s: %s", user_id, e)
+        if summary_tz is None:
+            summary_tz = "UTC"
+        logger.info(
+            "Batch summary timezone: %s (user_set=%s, user_id=%s)",
+            summary_tz,
+            summary_tz_from_user_setting,
+            user_id,
+        )
 
     try:
         # Create poll tasks for each job
@@ -1646,6 +1886,7 @@ async def _batch_coordinator(
                     single_message,
                     rendered_files,
                     batch_battle_stats,
+                    batch_replay_timestamps,
                 )
             )
             for i, (job_id, filename, replay_bytes) in enumerate(
@@ -1679,6 +1920,7 @@ async def _batch_coordinator(
             results_list,
             rendered_files,
             batch_battle_stats,
+            batch_replay_timestamps,
             single_message,
         )
 
@@ -1772,6 +2014,14 @@ async def _batch_coordinator(
                     if first_parsed else "Renders"
                 )
                 any_bucket_failed = False
+                if include_summary and batch_replay_timestamps is not None:
+                    meta_count = sum(1 for x in batch_replay_timestamps if x is not None)
+                    logger.info(
+                        "Batch summary: metadata_timestamps=%s/%s (rest use filename+tz=%s)",
+                        meta_count,
+                        len(batch_replay_timestamps),
+                        summary_tz or "UTC",
+                    )
                 # For include_summary: continuous numbering across buckets (second message starts at 7 if first had 6)
                 summary_start_by_bucket = []
                 if buckets:
@@ -1782,8 +2032,10 @@ async def _batch_coordinator(
                 for bucket_idx, bucket in enumerate(buckets):
                     if include_summary:
                         start_num = summary_start_by_bucket[bucket_idx]
+                        # When user set timezone, use filename+tz only (ignore metadata ts).
+                        # When user set timezone, use filename+tz so the moment is correct; else use metadata.
                         lines = [
-                            f"{start_num + idx + 1}. {format_replay_summary_line(results_list[i][0])}"
+                            f"{start_num + idx + 1}. {format_replay_summary_line(results_list[i][0], summary_tz, batch_replay_timestamps[i] if batch_replay_timestamps and not summary_tz_from_user_setting else None)}"
                             for idx, (i, _, _) in enumerate(bucket)
                         ]
                         header = ""
@@ -1841,6 +2093,14 @@ async def _batch_coordinator(
                         results_list[i] = (fn, "Done", sent_combined.jump_url)
 
                 if include_summary:
+                    if batch_replay_timestamps is not None:
+                        meta_count = sum(1 for x in batch_replay_timestamps if x is not None)
+                        logger.info(
+                            "Batch summary (single msg): metadata_timestamps=%s/%s (rest use filename+tz=%s)",
+                            meta_count,
+                            len(batch_replay_timestamps),
+                            summary_tz or "UTC",
+                        )
                     first_parsed = (
                         _parse_replay_filename(results_list[0][0])
                         if results_list
@@ -1852,8 +2112,10 @@ async def _batch_coordinator(
                         else "Renders"
                     )
                     overall = _format_summary_overall_stats(batch_battle_stats)
+                    # When user set timezone, use filename+tz only (ignore metadata ts).
+                    # When user set timezone, use filename+tz so the moment is correct; else use metadata.
                     summary_lines = [
-                        f"{i + 1}. {format_replay_summary_line(fn)}"
+                        f"{i + 1}. {format_replay_summary_line(fn, summary_tz, batch_replay_timestamps[i] if batch_replay_timestamps and not summary_tz_from_user_setting else None)}"
                         for i, (fn, st, link) in enumerate(results_list)
                     ]
                     content = f"# Renders for {date_title}\n\n"
@@ -2205,6 +2467,7 @@ class RenderCog(commands.Cog):
         include_summary = payload.get("include_summary", False)
         rendered_files = [None] * len(replays)
         batch_battle_stats: list[Optional[BattleStats]] = [None] * len(replays)
+        batch_replay_timestamps: list[Optional[int]] = [None] * len(replays)
         desc_lines = [
             f"{i + 1}. **{format_replay_display(fn)}**: Queued"
             for i, fn in enumerate(filenames)
@@ -2222,6 +2485,7 @@ class RenderCog(commands.Cog):
         application_id = payload.get("application_id")
 
         # Use coordinator pattern: ONE task handles all jobs + final send/cleanup
+        # Pass upload time so we infer uploader timezone and show their local time in summary.
         self.bot.loop.create_task(
             _batch_coordinator(
                 self.bot,
@@ -2239,6 +2503,8 @@ class RenderCog(commands.Cog):
                 message.id,
                 rendered_files,
                 batch_battle_stats,
+                batch_replay_timestamps,
+                upload_timestamp=message.created_at.timestamp(),
             )
         )
         return True
