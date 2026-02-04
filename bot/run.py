@@ -7,6 +7,7 @@ sys.path.insert(1, os.path.join(sys.path[0], ".."))
 from bot.shrimpy import Shrimpy
 from bot.utils import logs
 from config import cfg
+from version import __version__
 
 
 if __name__ == "__main__":
@@ -14,7 +15,7 @@ if __name__ == "__main__":
     parser.add_argument("--sync", action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     try:
-        logs.logger.info("Launching bot")
+        logs.logger.info("Launching bot v%s", __version__)
         bot = Shrimpy(args.sync)
         bot.run(cfg.discord.token, log_handler=logs.handler)
     except Exception as e:
