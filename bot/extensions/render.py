@@ -497,13 +497,13 @@ def format_replay_summary_line(
 
 
 def _format_summary_overall_stats(batch_battle_stats: Optional[list]) -> str:
-    """Build '**Overall Statistics**:\\n\\nWin-Rate: 60%' block for include_summary. Only titles bold."""
+    """Build '**Overall Statistics**:\\nWin-Rate: 60%' block for include_summary. Only titles bold."""
     if not batch_battle_stats:
         return ""
     wins, total, rate = aggregate_win_rate(batch_battle_stats)
     if total == 0 or rate is None:
         return ""
-    return f"**Overall Statistics**:\n\nWin-Rate: {rate:.0f}%"
+    return f"**Overall Statistics**:\nWin-Rate: {rate:.0f}%"
 
 
 WOWS_TOURNAMENTS_CHANNELS = [
