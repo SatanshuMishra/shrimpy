@@ -133,6 +133,7 @@ class Shrimpy(commands.AutoShardedBot):
 
     async def setup_hook(self) -> None:
         try:
+            await db.ensure_schema()
             await self.load_extensions()
         except commands.ExtensionError as error:
             print(f"Failed to load extension {error.name}.")
