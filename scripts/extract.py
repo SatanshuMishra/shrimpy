@@ -19,14 +19,6 @@ UNPACK_LIST = (
 )
 
 
-def _build_include_args():
-    include = []
-    for pattern in UNPACK_LIST:
-        include.append("-I")
-        include.append(pattern)
-    return include
-
-
 def extract_resources(
     wows_root: Path,
     bin_num: str,
@@ -38,22 +30,18 @@ def extract_resources(
     unpacker_path = Path(unpacker_path)
 
     bin_path = wows_root / "bin" / str(bin_num)
-    idx_path = bin_path / "idx"
-    pkg_path = wows_root / "res_packages"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    include = _build_include_args()
-
+    # New wowsunpack CLI: [exe] -g <game_dir> extract <files>... -o <out_dir>
     subprocess.run(
         [
             str(unpacker_path),
-            "-x",
-            str(idx_path),
-            "-p",
-            str(pkg_path),
+            "-g",
+            str(wows_root),
+            "extract",
+            *UNPACK_LIST,
             "-o",
             str(output_dir),
-            *include,
         ],
         check=True,
     )
