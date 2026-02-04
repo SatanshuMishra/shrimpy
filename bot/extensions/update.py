@@ -38,7 +38,20 @@ def scrape():
                 return
 
             soup = bs4.BeautifulSoup(response.text, "html.parser")
-            link = soup.find("article").find("vue-news-link")
+            article = soup.find("article")
+            if not article:
+                logger.warning(
+                    "Updates: no <article> found for %s; page structure may have changed",
+                    region,
+                )
+                continue
+            link = article.find("vue-news-link")
+            if not link or not link.get("link"):
+                logger.warning(
+                    "Updates: no vue-news-link or link for %s; page structure may have changed",
+                    region,
+                )
+                continue
             article_url = url + link.get("link")
 
             response = requests.get(article_url, params={"pjax": "1"})
@@ -50,12 +63,22 @@ def scrape():
                 return
 
             soup = bs4.BeautifulSoup(response.text, "html.parser")
-            times = soup.find("vue-local-time").get("time-list")
+            local_time = soup.find("vue-local-time")
+            if not local_time or not local_time.get("time-list"):
+                logger.warning(
+                    "Updates: no vue-local-time or time-list for %s; page structure may have changed",
+                    region,
+                )
+                continue
+            times = local_time.get("time-list")
             match = re.match(PATTERN, times)
 
             if not match:
-                logger.error("Failed to extract times with regex")
-                return
+                logger.warning(
+                    "Updates: failed to extract times with regex for %s",
+                    region,
+                )
+                continue
 
             time_from = int(match.group(1)) // 1000
             time_until = int(match.group(2)) // 1000
