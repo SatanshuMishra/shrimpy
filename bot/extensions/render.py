@@ -1337,14 +1337,15 @@ async def _edit_batch_prompt_to_timeout(
         logger.debug("Could not edit batch prompt to timeout: %s", e)
 
 
-async def _batch_check(
-    channel: discord.abc.Messageable,
+async def _batch_check_result(
     user_id: int,
     user_mention: str,
-    count: int,
-) -> bool:
-    """Validate batch can run; send error to channel and return False if not."""
-    # Run sync RQ/Redis calls in executor to avoid blocking event loop
+    count: int = 1,
+) -> tuple[bool, Optional[str]]:
+    """
+    Validate batch can run. Returns (True, None) if ok, else (False, error_message).
+    Use count=1 for pre-prompt check (before files); use actual count when handling reply.
+    """
     worker_count = await _run_sync(
         rq.worker.Worker.count, connection=_redis, queue=RenderSingle.QUEUE
     )
@@ -1363,10 +1364,51 @@ async def _batch_check(
         assert not task_request_exists, (
             f"{user_mention} You have an ongoing/queued render. Please try again later."
         )
-        return True
+        return True, None
     except AssertionError as e:
-        await channel.send(str(e))
-        return False
+        return False, str(e)
+
+
+async def _batch_check(
+    channel: discord.abc.Messageable,
+    user_id: int,
+    user_mention: str,
+    count: int,
+) -> bool:
+    """Validate batch can run; send error to channel and return False if not."""
+    ok, error = await _batch_check_result(user_id, user_mention, count)
+    if not ok and error:
+        await channel.send(error)
+    return ok
+
+
+def _batch_failed_job_error(job) -> tuple[str, str]:
+    """
+    Get a clear error message and full exc_info from a failed RQ job.
+    Returns (user_message, exc_info_string). exc_info may be empty if not available.
+    """
+    exc_info = getattr(job, "exc_info", None) or ""
+    if not exc_info or not isinstance(exc_info, str):
+        return ("An unhandled error occurred.", exc_info or "")
+
+    # Last non-empty line of traceback is usually "ExceptionType: message"
+    lines = [ln.strip() for ln in exc_info.strip().splitlines() if ln.strip()]
+    if lines:
+        last_line = lines[-1]
+        if ":" in last_line or "Error" in last_line or "Exception" in last_line:
+            short = last_line[:200]  # cap length for Discord/embed
+            return (short, exc_info)
+
+    # Fallbacks for common patterns (match single-render behavior)
+    if "StopIteration" in exc_info:
+        return ("An unhandled error occurred (likely incomplete replay).", exc_info)
+    if "VersionNotFoundError" in exc_info:
+        return ("Replay version not supported.", exc_info)
+    if "RenderError" in exc_info:
+        for ln in lines:
+            if "RenderError" in ln and ":" in ln:
+                return (ln.split(":", 1)[-1].strip()[:200], exc_info)
+    return ("An unhandled error occurred.", exc_info)
 
 
 def _batch_aggregate_progress(job_ids: list, total: int) -> float:
@@ -1478,6 +1520,16 @@ async def _poll_single_batch_job(
         ),
     )
 
+    logger.info(
+        "[BATCH] job %s/%s polling: job_id=%s filename=%s wait_cap=%ss",
+        job_index + 1,
+        total,
+        job_id,
+        filename[:50] if len(filename) > 50 else filename,
+        wait_cap,
+    )
+    last_logged_status = None
+
     try:
         while True:
             # Wait for pubsub message or fallback timeout; then always check RQ status.
@@ -1493,8 +1545,26 @@ async def _poll_single_batch_job(
                 continue
 
             status = await _run_sync(job.get_status, refresh=True)
+            if status != last_logged_status and status == "started":
+                logger.info(
+                    "[BATCH] job %s/%s started (worker picked up): job_id=%s filename=%s",
+                    job_index + 1,
+                    total,
+                    job_id,
+                    filename[:50] if len(filename) > 50 else filename,
+                )
+                last_logged_status = status
             if status not in ("finished", "failed"):
                 if (time.time() - started_at) >= wait_cap:
+                    logger.info(
+                        "[BATCH] job %s/%s FAILED poll timeout: job_id=%s status=%s waited=%.0fs filename=%s",
+                        job_index + 1,
+                        total,
+                        job_id,
+                        status,
+                        time.time() - started_at,
+                        filename[:50] if len(filename) > 50 else filename,
+                    )
                     async with lock:
                         results_list[job_index] = (
                             filename,
@@ -1535,12 +1605,27 @@ async def _poll_single_batch_job(
                             batch_replay_timestamps[job_index] = replay_ts
                         if rendered_files is not None:
                             rendered_files[job_index] = (out_name, data)
+                        logger.info(
+                            "[BATCH] job %s/%s finished: job_id=%s filename=%s took=%s",
+                            job_index + 1,
+                            total,
+                            job_id,
+                            filename[:50] if len(filename) > 50 else filename,
+                            time_taken,
+                        )
                         if compact:
                             # Coordinator will send combined; just mark done
                             results_list[job_index] = (filename, "Done", None)
                         else:
                             # Send individually with robust retries
                             if len(data) > DISCORD_MAX_FILE_BYTES:
+                                logger.info(
+                                    "[BATCH] job %s/%s FAILED file too large: job_id=%s filename=%s",
+                                    job_index + 1,
+                                    total,
+                                    job_id,
+                                    filename[:50] if len(filename) > 50 else filename,
+                                )
                                 results_list[job_index] = (
                                     filename,
                                     "Failed",
@@ -1582,18 +1667,41 @@ async def _poll_single_batch_job(
                                         sent.jump_url,
                                     )
                                 else:
+                                    logger.info(
+                                        "[BATCH] job %s/%s FAILED to post to Discord: job_id=%s filename=%s",
+                                        job_index + 1,
+                                        total,
+                                        job_id,
+                                        filename[:50] if len(filename) > 50 else filename,
+                                    )
                                     results_list[job_index] = (
                                         filename,
                                         "Failed",
                                         FAILED_TO_POST_MSG,
                                     )
                     elif isinstance(job.result, errors.RenderError):
+                        logger.info(
+                            "[BATCH] job %s/%s FAILED RenderError: job_id=%s filename=%s message=%s",
+                            job_index + 1,
+                            total,
+                            job_id,
+                            filename[:50] if len(filename) > 50 else filename,
+                            job.result.message,
+                        )
                         results_list[job_index] = (
                             filename,
                             "Failed",
                             job.result.message,
                         )
                     else:
+                        logger.info(
+                            "[BATCH] job %s/%s FAILED unknown result: job_id=%s filename=%s result_type=%s",
+                            job_index + 1,
+                            total,
+                            job_id,
+                            filename[:50] if len(filename) > 50 else filename,
+                            type(job.result).__name__,
+                        )
                         results_list[job_index] = (
                             filename,
                             "Failed",
@@ -1602,8 +1710,30 @@ async def _poll_single_batch_job(
                 elif status == "failed":
                     meta = await _run_sync(job.get_meta, refresh=True)
                     timeout = meta.get("timeout", False)
-                    err = "Job timed out." if timeout else "An unhandled error occurred."
-                    results_list[job_index] = (filename, "Failed", err)
+                    if timeout:
+                        err_message = "Job timed out."
+                        exc_info_str = ""
+                    else:
+                        job_fresh = await _run_sync(
+                            rq.job.Job.fetch, job_id, connection=_redis
+                        )
+                        err_message, exc_info_str = _batch_failed_job_error(job_fresh)
+                    logger.info(
+                        "[BATCH] job %s/%s FAILED in RQ: job_id=%s filename=%s reason=%s",
+                        job_index + 1,
+                        total,
+                        job_id,
+                        filename[:50] if len(filename) > 50 else filename,
+                        err_message,
+                    )
+                    if exc_info_str:
+                        logger.info(
+                            "[BATCH] job %s/%s exc_info (first 800 chars): %s",
+                            job_index + 1,
+                            total,
+                            (exc_info_str[:800] + "..." if len(exc_info_str) > 800 else exc_info_str),
+                        )
+                    results_list[job_index] = (filename, "Failed", err_message)
                     try:
                         ch = await bot.fetch_channel(cfg.channels.failed_renders)
                         await ch.send(
@@ -1616,6 +1746,14 @@ async def _poll_single_batch_job(
                     except Exception:
                         pass
                 else:
+                    logger.info(
+                        "[BATCH] job %s/%s FAILED status=%s (no result): job_id=%s filename=%s",
+                        job_index + 1,
+                        total,
+                        status,
+                        job_id,
+                        filename[:50] if len(filename) > 50 else filename,
+                    )
                     results_list[job_index] = (
                         filename,
                         "Failed",
@@ -1791,14 +1929,31 @@ async def _recover_finished_batch_jobs(
                 # Job failed permanently; mark as failed (no retry left)
                 meta = await _run_sync(job.get_meta, refresh=True)
                 timeout = meta.get("timeout", False)
-                err = "Job timed out." if timeout else "Render failed after retries."
-                results_list[i] = (fn, "Failed", err)
-                logger.warning(
-                    "Batch job %s (index %s) failed permanently in RQ: %s",
+                if timeout:
+                    err_message = "Job timed out."
+                    exc_info_str = ""
+                else:
+                    job_fresh = await _run_sync(
+                        rq.job.Job.fetch, job_ids[i], connection=_redis
+                    )
+                    err_message, exc_info_str = _batch_failed_job_error(job_fresh)
+                results_list[i] = (fn, "Failed", err_message)
+                logger.info(
+                    "[BATCH] job %s/%s FAILED in recovery: job_id=%s index=%s filename=%s reason=%s",
+                    i + 1,
+                    len(job_ids),
                     job_ids[i],
                     i,
-                    err,
+                    fn[:50] if len(fn) > 50 else fn,
+                    err_message,
                 )
+                if exc_info_str:
+                    logger.info(
+                        "[BATCH] job %s/%s exc_info (first 800 chars): %s",
+                        i + 1,
+                        len(job_ids),
+                        (exc_info_str[:800] + "..." if len(exc_info_str) > 800 else exc_info_str),
+                    )
 
         # If there are still jobs running in RQ, wait before next poll
         if jobs_still_running:
@@ -1845,6 +2000,11 @@ async def _batch_coordinator(
     """
     lock = asyncio.Lock()
     total = len(job_ids)
+    logger.info(
+        "[BATCH] coordinator started: total=%s jobs job_ids=%s",
+        total,
+        job_ids,
+    )
     batch_temp_dir: Optional[Path] = None
     # Resolve timezone for summary display: user-set > UTC.
     summary_tz = None
@@ -2340,6 +2500,15 @@ class RenderCog(commands.Cog):
         summary: bool = False,
     ):
         await interaction.response.defer()
+        # Check worker, queue, cooldown, and ongoing render BEFORE prompting for files.
+        ok, error = await _batch_check_result(
+            interaction.user.id,
+            interaction.user.mention,
+            count=1,
+        )
+        if not ok and error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
         embed = discord.Embed(
             title=RenderEmbed.BATCH_TITLE_PROMPT,
             color=RenderEmbed.BATCH_COLOR_STARTING,
@@ -2441,7 +2610,7 @@ class RenderCog(commands.Cog):
         # Immediate retries (no interval) work on Windows without scheduler.
         retry_config = Retry(max=BATCH_JOB_RETRY_MAX)
         job_ids = []
-        for data in bytes_list:
+        for i, (filename, data) in enumerate(zip(filenames, bytes_list)):
             job = queue.enqueue(
                 tasks.render_single,
                 args=[
@@ -2461,6 +2630,13 @@ class RenderCog(commands.Cog):
                 retry=retry_config,
             )
             job_ids.append(job.id)
+            logger.info(
+                "[BATCH] job %s/%s enqueued: job_id=%s filename=%s",
+                i + 1,
+                batch_size,
+                job.id,
+                filename[:60] if len(filename) > 60 else filename,
+            )
 
         results_list = [(fn, "Queued", None) for fn in filenames]
         compact = payload.get("compact", False)
